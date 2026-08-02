@@ -1,0 +1,2 @@
+https://example.com/files/sample-1.zip
+https://example.com/files/sample-2.pdf

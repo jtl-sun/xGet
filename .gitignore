@@ -1,0 +1,26 @@
+# Runtime downloads and generated mirrors
+/downloads/
+/home/
+
+# Historical binaries and local release archives
+/old_files/
+/*.zip
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local credentials, browser cookies, sessions, and aria2 state
+cookies.txt
+*.session
+*.aria2
+*.torrent
+*.log
+
+# Editor and operating-system metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
