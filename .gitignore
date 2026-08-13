@@ -1,6 +1,7 @@
 # Runtime downloads and generated mirrors
 /downloads/
 /home/
+/mp3_output/
 
 # Historical binaries and local release archives
 /old_files/

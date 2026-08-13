@@ -1,0 +1,11 @@
+* text=auto
+
+# Keep Unix entry-point scripts usable after a Windows checkout.
+*.sh text eol=lf
+*.py text eol=lf
+
+# PowerShell supports LF, which keeps repository diffs consistent.
+*.ps1 text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
