@@ -1,4 +1,4 @@
-# xGet 2.9.0
+# xGet 2.9.2
 
 xGet is a menu-driven integrated terminal downloader for Windows and Ubuntu.
 
@@ -115,10 +115,10 @@ The default YouTube download format is M4A audio. MP4 video and MP3 audio
 remain available from the format menu. M4A is preferred directly from YouTube
 and FFmpeg finalizes the file as M4A when conversion is required.
 
-Large playlists use conservative pacing by default: one second between
-extraction requests, a conservative randomized 10-15 second pause before each
-video, and one
-media fragment connection. Successful video IDs are saved in
+Large playlists run in fast mode with no artificial delay between extraction
+requests or videos, and up to four media fragment connections. Five download
+errors at any point automatically stop the remaining playlist so a temporary
+service limit does not produce endless failures. Successful video IDs are saved in
 `downloads/.xget-youtube-archive.txt`. If a run is interrupted or YouTube
 temporarily rate-limits the session, run the same playlist again later; xGet
 will skip recorded items and continue with the remainder.

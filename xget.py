@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from pathlib import Path
@@ -19,7 +20,8 @@ from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse, urlunp
 
 
 APP_NAME = "xGet"
-VERSION = "2.9.0"
+VERSION = "2.9.2"
+YOUTUBE_ERROR_LIMIT = 5
 HTTP_RE = re.compile(r"^https?://", re.IGNORECASE)
 MAGNET_RE = re.compile(r"^magnet:\?xt=urn:", re.IGNORECASE)
 APP_DIR = Path(__file__).resolve().parent
@@ -713,8 +715,64 @@ def read_youtube_urls() -> list[str]:
     return list(dict.fromkeys(urls))
 
 
+class YoutubeRunStopped(RuntimeError):
+    """Raised when repeated YouTube errors trip the large-run circuit breaker."""
+
+
+class YoutubeRunMonitor:
+    """Track completed items and stop a large run after persistent errors."""
+
+    def __init__(
+        self,
+        error_limit: int = YOUTUBE_ERROR_LIMIT,
+    ) -> None:
+        self.error_limit = error_limit
+        self.completed = 0
+        self.consecutive_errors = 0
+        self.stopped = False
+        self.stop_message = ""
+        self._lock = threading.Lock()
+
+    def progress_hook(self, status: dict) -> None:
+        if status.get("status") != "finished":
+            return
+        with self._lock:
+            self.completed += 1
+
+    def record_error(self, message: str) -> None:
+        with self._lock:
+            if self.stopped:
+                raise YoutubeRunStopped(self.stop_message)
+            self.consecutive_errors += 1
+            if self.consecutive_errors >= self.error_limit:
+                self.stopped = True
+                self.stop_message = (
+                    f"Stopped because {self.consecutive_errors} download errors occurred. "
+                    "Run xGet again later with the same URL; completed items will be skipped."
+                )
+                raise YoutubeRunStopped(self.stop_message)
+
+
+class YoutubeMonitorLogger:
+    def __init__(self, monitor: YoutubeRunMonitor) -> None:
+        self.monitor = monitor
+
+    def debug(self, message: str) -> None:
+        print(message)
+
+    def warning(self, message: str) -> None:
+        print(message, file=sys.stderr)
+
+    def error(self, message: str) -> None:
+        print(message, file=sys.stderr)
+        self.monitor.record_error(message)
+
+
 def youtube_options(
-    output: Path, audio_format: str | None, cookie_file: Path | None
+    output: Path,
+    audio_format: str | None,
+    cookie_file: Path | None,
+    monitor: YoutubeRunMonitor | None = None,
 ) -> dict:
     ffmpeg_available = bool(tool_path("ffmpeg"))
     if audio_format:
@@ -748,19 +806,18 @@ def youtube_options(
             ),
         },
         "ignoreerrors": True,
+        # yt-dlp counts failed playlist entries itself and skips the rest as
+        # soon as the fifth extraction fails. This is the authoritative stop
+        # rule for a single large playlist.
+        "skip_playlist_after_errors": YOUTUBE_ERROR_LIMIT,
         "continuedl": True,
         "nopart": False,
-        # YouTube commonly rate-limits guest sessions after a few hundred
-        # videos per hour. Pace extraction and downloads instead of retrying
-        # aggressively. The randomized per-video delay is recommended by
-        # yt-dlp for large playlists.
-        "sleep_interval_requests": 1.0,
-        "sleep_interval": 10.0,
-        "max_sleep_interval": 15.0,
-        "retries": 10,
-        "fragment_retries": 10,
-        "extractor_retries": 3,
-        "concurrent_fragment_downloads": 1,
+        # No artificial time delay. A circuit breaker below stops persistent
+        # failures after a large run instead of slowing every download.
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 2,
+        "concurrent_fragment_downloads": 4,
         # Completed video IDs are recorded so restarting a large playlist
         # skips successful items and continues from the remaining entries.
         "download_archive": str(output / ".xget-youtube-archive.txt"),
@@ -772,6 +829,9 @@ def youtube_options(
         "quiet": False,
         "no_warnings": False,
     }
+    if monitor:
+        options["progress_hooks"] = [monitor.progress_hook]
+        options["logger"] = YoutubeMonitorLogger(monitor)
     if not audio_format and ffmpeg_available:
         options["merge_output_format"] = "mp4"
     if cookie_file and cookie_file.is_file():
@@ -814,13 +874,14 @@ def download_one_youtube(
     audio_format: str | None,
     cookie_file: Path | None,
     worker: int,
+    monitor: YoutubeRunMonitor | None = None,
 ) -> tuple[str, bool, str]:
     YoutubeDL = get_youtube_dl()
     if not YoutubeDL:
         return url, False, "The yt_dlp module is not installed."
     print(f"\n[JOB {worker}] Starting download: {url}")
     try:
-        with YoutubeDL(youtube_options(output, audio_format, cookie_file)) as ydl:
+        with YoutubeDL(youtube_options(output, audio_format, cookie_file, monitor)) as ydl:
             error_code = ydl.download([url])
         if error_code == 0:
             return url, True, "Completed"
@@ -862,9 +923,11 @@ def youtube_download() -> None:
         if workers > 1:
             print("[WARNING] Concurrent YouTube jobs increase the rate-limit risk.")
 
+    monitor = YoutubeRunMonitor()
     print(f"\nTotal URLs: {len(urls)} / Concurrent jobs: {workers}")
     print(f"Destination: {output}")
-    print("Safe pacing: 1 second between extraction requests and 10-15 seconds per video")
+    print("Fast mode: artificial request and per-video delays are disabled")
+    print(f"Auto-stop: after {monitor.error_limit} download errors")
     results: list[tuple[str, bool, str]] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
@@ -875,11 +938,16 @@ def youtube_download() -> None:
                 audio_format,
                 cookie_file,
                 index,
+                monitor,
             ): url
             for index, url in enumerate(urls, 1)
         }
         for future in as_completed(futures):
             results.append(future.result())
+            if monitor.stopped:
+                for pending in futures:
+                    pending.cancel()
+                break
 
     success = sum(1 for _, ok, _ in results if ok)
     print("\n" + "=" * 64)
@@ -888,6 +956,8 @@ def youtube_download() -> None:
         print(f"  {'[SUCCESS]' if ok else '[FAILED]'} {url}")
         if not ok:
             print(f"         {message}")
+    if monitor.stopped:
+        print(f"\n[STOPPED] {monitor.stop_message}")
 
 
 def cleanup_incomplete() -> None:

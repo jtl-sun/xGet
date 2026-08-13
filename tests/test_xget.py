@@ -53,10 +53,11 @@ class XGetTests(unittest.TestCase):
         self.assertIn("format", options)
         self.assertIn("default", options["outtmpl"])
         self.assertFalse(options["noplaylist"])
-        self.assertEqual(options["sleep_interval_requests"], 1.0)
-        self.assertEqual(options["sleep_interval"], 10.0)
-        self.assertEqual(options["max_sleep_interval"], 15.0)
-        self.assertEqual(options["concurrent_fragment_downloads"], 1)
+        self.assertNotIn("sleep_interval_requests", options)
+        self.assertNotIn("sleep_interval", options)
+        self.assertNotIn("max_sleep_interval", options)
+        self.assertEqual(options["concurrent_fragment_downloads"], 4)
+        self.assertEqual(options["skip_playlist_after_errors"], 5)
         self.assertTrue(options["download_archive"].endswith(
             ".xget-youtube-archive.txt"
         ))
@@ -81,6 +82,55 @@ class XGetTests(unittest.TestCase):
             self.assertEqual(archive.read_text(encoding="utf-8"), "youtube AbCdEf123_-\n")
             added_again, _ = xget.sync_youtube_archive(output)
             self.assertEqual(added_again, 0)
+
+    def test_youtube_monitor_stops_after_five_errors_at_any_point(self):
+        monitor = xget.YoutubeRunMonitor(error_limit=5)
+        monitor.record_error("first")
+        monitor.record_error("second")
+        monitor.record_error("third")
+        monitor.record_error("fourth")
+        with self.assertRaises(xget.YoutubeRunStopped):
+            monitor.record_error("fifth")
+        self.assertTrue(monitor.stopped)
+
+    def test_youtube_monitor_counts_errors_across_successes(self):
+        monitor = xget.YoutubeRunMonitor(error_limit=2)
+        monitor.progress_hook({"status": "finished"})
+        monitor.record_error("temporary")
+        monitor.progress_hook({"status": "finished"})
+        with self.assertRaises(xget.YoutubeRunStopped):
+            monitor.record_error("second")
+
+    def test_download_engine_is_interrupted_on_fifth_logged_error(self):
+        monitor = xget.YoutubeRunMonitor(error_limit=5)
+
+        class FakeYoutubeDL:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def download(self, _urls):
+                for number in range(1, 6):
+                    self.options["logger"].error(f"failed item {number}")
+                return 0
+
+        with patch.object(xget, "get_youtube_dl", return_value=FakeYoutubeDL):
+            _, success, message = xget.download_one_youtube(
+                "https://www.youtube.com/playlist?list=test",
+                Path("/tmp/output"),
+                "m4a",
+                None,
+                1,
+                monitor,
+            )
+        self.assertFalse(success)
+        self.assertTrue(monitor.stopped)
+        self.assertIn("5 download errors", message)
 
     def test_missing_ytdlp_does_not_install_during_check(self):
         result = xget.get_youtube_dl(auto_install=False)
