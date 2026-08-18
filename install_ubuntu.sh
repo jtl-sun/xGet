@@ -14,7 +14,7 @@ if [ -f "$(dirname "$0")/cookies.txt" ]; then
     install -m 600 "$(dirname "$0")/cookies.txt" "$install_dir/cookies.txt"
 fi
 python3 -m venv "$install_dir/.venv"
-"$install_dir/.venv/bin/python" -m pip install --upgrade pip yt-dlp requests beautifulsoup4
+"$install_dir/.venv/bin/python" -m pip install --upgrade pip --pre "yt-dlp[default]" requests beautifulsoup4
 
 launcher="$bin_dir/xget"
 printf '%s\n' '#!/usr/bin/env bash' \

@@ -1,4 +1,4 @@
-# xGet 2.9.0
+# xGet 2.10.0
 
 xGet is a menu-driven integrated terminal downloader for Windows and Ubuntu.
 
@@ -13,6 +13,7 @@ xGet is a menu-driven integrated terminal downloader for Windows and Ubuntu.
 - Download multiple YouTube URLs concurrently
 - Automatically use a local `cookies.txt` file
 - Clean incomplete download files
+- Manually refresh Deno, yt-dlp Nightly, and EJS without changing cookies
 - Download one or multiple `.torrent` files and Magnet links concurrently
 - Automatically repair missing Python modules
 - Mirror websites without a separate `wget.exe`
@@ -94,6 +95,7 @@ xget
 6. Resume an interrupted URL-list download
 7. Check dependency status
 8. Clean incomplete download files
+9. Refresh YouTube components (manual)
 0. Exit
 ```
 
@@ -115,10 +117,10 @@ The default YouTube download format is M4A audio. MP4 video and MP3 audio
 remain available from the format menu. M4A is preferred directly from YouTube
 and FFmpeg finalizes the file as M4A when conversion is required.
 
-Large playlists use conservative pacing by default: one second between
-extraction requests, a conservative randomized 10-15 second pause before each
-video, and one
-media fragment connection. Successful video IDs are saved in
+Large playlists run in fast mode with no artificial delay between extraction
+requests or videos, and up to four media fragment connections. Five download
+errors at any point automatically stop the remaining playlist so a temporary
+service limit does not produce endless failures. Successful video IDs are saved in
 `downloads/.xget-youtube-archive.txt`. If a run is interrupted or YouTube
 temporarily rate-limits the session, run the same playlist again later; xGet
 will skip recorded items and continue with the remainder.
@@ -128,6 +130,14 @@ session rate-limit notice is a temporary YouTube request limit, not a local
 file-count limit. Stop the run, wait for the period shown by YouTube (often up
 to an hour), and then resume. Starting more simultaneous jobs while limited
 usually prolongs the problem.
+
+## Manual YouTube Refresh
+
+If YouTube downloads repeatedly fail with HTTP 403 or JavaScript challenge
+errors, select menu 9 and confirm the refresh. xGet updates Deno plus the
+Nightly `yt-dlp[default]` package, which includes the matching EJS challenge
+scripts. The refresh runs only when selected and confirmed. It does not modify
+`cookies.txt`, downloaded media, or `.xget-youtube-archive.txt`.
 
 Windows installations can be updated by running `install_windows.ps1` again.
 Ubuntu installations can be updated by running `install_ubuntu.sh` again.

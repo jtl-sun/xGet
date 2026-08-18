@@ -53,10 +53,11 @@ class XGetTests(unittest.TestCase):
         self.assertIn("format", options)
         self.assertIn("default", options["outtmpl"])
         self.assertFalse(options["noplaylist"])
-        self.assertEqual(options["sleep_interval_requests"], 1.0)
-        self.assertEqual(options["sleep_interval"], 10.0)
-        self.assertEqual(options["max_sleep_interval"], 15.0)
-        self.assertEqual(options["concurrent_fragment_downloads"], 1)
+        self.assertNotIn("sleep_interval_requests", options)
+        self.assertNotIn("sleep_interval", options)
+        self.assertNotIn("max_sleep_interval", options)
+        self.assertEqual(options["concurrent_fragment_downloads"], 4)
+        self.assertEqual(options["skip_playlist_after_errors"], 5)
         self.assertTrue(options["download_archive"].endswith(
             ".xget-youtube-archive.txt"
         ))
@@ -82,9 +83,93 @@ class XGetTests(unittest.TestCase):
             added_again, _ = xget.sync_youtube_archive(output)
             self.assertEqual(added_again, 0)
 
+    def test_youtube_monitor_stops_after_five_errors_at_any_point(self):
+        monitor = xget.YoutubeRunMonitor(error_limit=5)
+        monitor.record_error("first")
+        monitor.record_error("second")
+        monitor.record_error("third")
+        monitor.record_error("fourth")
+        with self.assertRaises(xget.YoutubeRunStopped):
+            monitor.record_error("fifth")
+        self.assertTrue(monitor.stopped)
+
+    def test_youtube_monitor_counts_errors_across_successes(self):
+        monitor = xget.YoutubeRunMonitor(error_limit=2)
+        monitor.progress_hook({"status": "finished"})
+        monitor.record_error("temporary")
+        monitor.progress_hook({"status": "finished"})
+        with self.assertRaises(xget.YoutubeRunStopped):
+            monitor.record_error("second")
+
+    def test_download_engine_is_interrupted_on_fifth_logged_error(self):
+        monitor = xget.YoutubeRunMonitor(error_limit=5)
+
+        class FakeYoutubeDL:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def download(self, _urls):
+                for number in range(1, 6):
+                    self.options["logger"].error(f"failed item {number}")
+                return 0
+
+        with patch.object(xget, "get_youtube_dl", return_value=FakeYoutubeDL):
+            _, success, message = xget.download_one_youtube(
+                "https://www.youtube.com/playlist?list=test",
+                Path("/tmp/output"),
+                "m4a",
+                None,
+                1,
+                monitor,
+            )
+        self.assertFalse(success)
+        self.assertTrue(monitor.stopped)
+        self.assertIn("5 download errors", message)
+
     def test_missing_ytdlp_does_not_install_during_check(self):
         result = xget.get_youtube_dl(auto_install=False)
         self.assertTrue(result is None or callable(result))
+
+    def test_youtube_refresh_uses_nightly_default_package(self):
+        command = xget.youtube_refresh_pip_command()
+        self.assertEqual(command[0], xget.sys.executable)
+        self.assertIn("--pre", command)
+        self.assertIn("yt-dlp[default]", command)
+
+    def test_new_tool_directory_is_added_to_current_path(self):
+        with patch.dict(xget.os.environ, {"PATH": "existing"}):
+            xget.make_tool_available("/opt/deno/bin/deno")
+            self.assertEqual(
+                xget.os.environ["PATH"].split(xget.os.pathsep)[0],
+                "/opt/deno/bin",
+            )
+
+    def test_youtube_refresh_is_manual_and_can_be_cancelled(self):
+        with patch("builtins.input", return_value="N"), patch.object(
+            xget, "refresh_deno"
+        ) as refresh_deno, patch.object(xget, "run") as run_command:
+            xget.refresh_youtube_components()
+        refresh_deno.assert_not_called()
+        run_command.assert_not_called()
+
+    def test_youtube_refresh_does_not_change_cookies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app_dir = Path(directory)
+            cookie = app_dir / "cookies.txt"
+            cookie.write_bytes(b"keep-this-cookie")
+            with patch.object(xget, "APP_DIR", app_dir), patch(
+                "builtins.input", return_value="y"
+            ), patch.object(xget, "refresh_deno", return_value=True), patch.object(
+                xget, "run", return_value=True
+            ):
+                xget.refresh_youtube_components()
+            self.assertEqual(cookie.read_bytes(), b"keep-this-cookie")
 
     def test_url_to_local_homepage(self):
         result = xget.url_to_local(Path("/mirror"), "https://example.com/", "text/html")

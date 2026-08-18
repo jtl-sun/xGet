@@ -9,7 +9,8 @@ if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
 $packages = @(
     @{ Id = "Python.Python.3.12"; Name = "Python" },
     @{ Id = "aria2.aria2"; Name = "aria2" },
-    @{ Id = "Gyan.FFmpeg"; Name = "FFmpeg" }
+    @{ Id = "Gyan.FFmpeg"; Name = "FFmpeg" },
+    @{ Id = "DenoLand.Deno"; Name = "Deno" }
 )
 
 foreach ($package in $packages) {
@@ -48,7 +49,7 @@ $venvPython = Join-Path $venvDir "Scripts\python.exe"
 if (-not (Test-Path $venvPython)) {
     throw "Failed to create the xGet Python environment: $venvPython"
 }
-& $venvPython -m pip install --upgrade pip yt-dlp requests beautifulsoup4
+& $venvPython -m pip install --upgrade pip --pre "yt-dlp[default]" requests beautifulsoup4
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to install the xGet Python modules. Check your internet connection and try again."
 }
