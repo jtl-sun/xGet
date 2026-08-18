@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import glob
 import hashlib
+import importlib.metadata
 import os
 import posixpath
 import re
 import shutil
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from pathlib import Path
@@ -19,7 +21,8 @@ from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse, urlunp
 
 
 APP_NAME = "xGet"
-VERSION = "2.9.0"
+VERSION = "2.10.0"
+YOUTUBE_ERROR_LIMIT = 5
 HTTP_RE = re.compile(r"^https?://", re.IGNORECASE)
 MAGNET_RE = re.compile(r"^magnet:\?xt=urn:", re.IGNORECASE)
 APP_DIR = Path(__file__).resolve().parent
@@ -54,15 +57,25 @@ def pause() -> None:
 
 def tool_path(name: str) -> str | None:
     found = shutil.which(name) or (shutil.which(f"{name}.exe") if os.name == "nt" else None)
-    if found or os.name != "nt":
+    if found:
         return found
-    if name.lower() == "aria2c":
+    if os.name != "nt":
+        if name.lower() == "deno":
+            local_deno = Path.home() / ".deno" / "bin" / "deno"
+            if local_deno.is_file():
+                return str(local_deno)
+        return None
+    if name.lower() in {"aria2c", "deno"}:
         local_app_data = os.environ.get("LOCALAPPDATA")
         if local_app_data:
             package_root = Path(local_app_data) / "Microsoft" / "WinGet" / "Packages"
             if package_root.is_dir():
-                candidates = list(package_root.glob("aria2.aria2_*/*/aria2c.exe"))
-                candidates += list(package_root.glob("aria2.aria2_*/aria2c.exe"))
+                if name.lower() == "aria2c":
+                    candidates = list(package_root.glob("aria2.aria2_*/*/aria2c.exe"))
+                    candidates += list(package_root.glob("aria2.aria2_*/aria2c.exe"))
+                else:
+                    candidates = list(package_root.glob("DenoLand.Deno_*/*/deno.exe"))
+                    candidates += list(package_root.glob("DenoLand.Deno_*/deno.exe"))
                 for candidate in candidates:
                     if candidate.is_file():
                         return str(candidate)
@@ -96,7 +109,8 @@ def get_youtube_dl(auto_install: bool = True):
             "pip",
             "install",
             "--upgrade",
-            "yt-dlp",
+            "--pre",
+            "yt-dlp[default]",
         ]
         result = subprocess.run(command, check=False)
         if result.returncode != 0:
@@ -713,8 +727,64 @@ def read_youtube_urls() -> list[str]:
     return list(dict.fromkeys(urls))
 
 
+class YoutubeRunStopped(RuntimeError):
+    """Raised when repeated YouTube errors trip the large-run circuit breaker."""
+
+
+class YoutubeRunMonitor:
+    """Track completed items and stop a large run after persistent errors."""
+
+    def __init__(
+        self,
+        error_limit: int = YOUTUBE_ERROR_LIMIT,
+    ) -> None:
+        self.error_limit = error_limit
+        self.completed = 0
+        self.consecutive_errors = 0
+        self.stopped = False
+        self.stop_message = ""
+        self._lock = threading.Lock()
+
+    def progress_hook(self, status: dict) -> None:
+        if status.get("status") != "finished":
+            return
+        with self._lock:
+            self.completed += 1
+
+    def record_error(self, message: str) -> None:
+        with self._lock:
+            if self.stopped:
+                raise YoutubeRunStopped(self.stop_message)
+            self.consecutive_errors += 1
+            if self.consecutive_errors >= self.error_limit:
+                self.stopped = True
+                self.stop_message = (
+                    f"Stopped because {self.consecutive_errors} download errors occurred. "
+                    "Run xGet again later with the same URL; completed items will be skipped."
+                )
+                raise YoutubeRunStopped(self.stop_message)
+
+
+class YoutubeMonitorLogger:
+    def __init__(self, monitor: YoutubeRunMonitor) -> None:
+        self.monitor = monitor
+
+    def debug(self, message: str) -> None:
+        print(message)
+
+    def warning(self, message: str) -> None:
+        print(message, file=sys.stderr)
+
+    def error(self, message: str) -> None:
+        print(message, file=sys.stderr)
+        self.monitor.record_error(message)
+
+
 def youtube_options(
-    output: Path, audio_format: str | None, cookie_file: Path | None
+    output: Path,
+    audio_format: str | None,
+    cookie_file: Path | None,
+    monitor: YoutubeRunMonitor | None = None,
 ) -> dict:
     ffmpeg_available = bool(tool_path("ffmpeg"))
     if audio_format:
@@ -748,19 +818,18 @@ def youtube_options(
             ),
         },
         "ignoreerrors": True,
+        # yt-dlp counts failed playlist entries itself and skips the rest as
+        # soon as the fifth extraction fails. This is the authoritative stop
+        # rule for a single large playlist.
+        "skip_playlist_after_errors": YOUTUBE_ERROR_LIMIT,
         "continuedl": True,
         "nopart": False,
-        # YouTube commonly rate-limits guest sessions after a few hundred
-        # videos per hour. Pace extraction and downloads instead of retrying
-        # aggressively. The randomized per-video delay is recommended by
-        # yt-dlp for large playlists.
-        "sleep_interval_requests": 1.0,
-        "sleep_interval": 10.0,
-        "max_sleep_interval": 15.0,
-        "retries": 10,
-        "fragment_retries": 10,
-        "extractor_retries": 3,
-        "concurrent_fragment_downloads": 1,
+        # No artificial time delay. A circuit breaker below stops persistent
+        # failures after a large run instead of slowing every download.
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 2,
+        "concurrent_fragment_downloads": 4,
         # Completed video IDs are recorded so restarting a large playlist
         # skips successful items and continues from the remaining entries.
         "download_archive": str(output / ".xget-youtube-archive.txt"),
@@ -772,6 +841,9 @@ def youtube_options(
         "quiet": False,
         "no_warnings": False,
     }
+    if monitor:
+        options["progress_hooks"] = [monitor.progress_hook]
+        options["logger"] = YoutubeMonitorLogger(monitor)
     if not audio_format and ffmpeg_available:
         options["merge_output_format"] = "mp4"
     if cookie_file and cookie_file.is_file():
@@ -814,13 +886,14 @@ def download_one_youtube(
     audio_format: str | None,
     cookie_file: Path | None,
     worker: int,
+    monitor: YoutubeRunMonitor | None = None,
 ) -> tuple[str, bool, str]:
     YoutubeDL = get_youtube_dl()
     if not YoutubeDL:
         return url, False, "The yt_dlp module is not installed."
     print(f"\n[JOB {worker}] Starting download: {url}")
     try:
-        with YoutubeDL(youtube_options(output, audio_format, cookie_file)) as ydl:
+        with YoutubeDL(youtube_options(output, audio_format, cookie_file, monitor)) as ydl:
             error_code = ydl.download([url])
         if error_code == 0:
             return url, True, "Completed"
@@ -862,9 +935,11 @@ def youtube_download() -> None:
         if workers > 1:
             print("[WARNING] Concurrent YouTube jobs increase the rate-limit risk.")
 
+    monitor = YoutubeRunMonitor()
     print(f"\nTotal URLs: {len(urls)} / Concurrent jobs: {workers}")
     print(f"Destination: {output}")
-    print("Safe pacing: 1 second between extraction requests and 10-15 seconds per video")
+    print("Fast mode: artificial request and per-video delays are disabled")
+    print(f"Auto-stop: after {monitor.error_limit} download errors")
     results: list[tuple[str, bool, str]] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
@@ -875,11 +950,16 @@ def youtube_download() -> None:
                 audio_format,
                 cookie_file,
                 index,
+                monitor,
             ): url
             for index, url in enumerate(urls, 1)
         }
         for future in as_completed(futures):
             results.append(future.result())
+            if monitor.stopped:
+                for pending in futures:
+                    pending.cancel()
+                break
 
     success = sum(1 for _, ok, _ in results if ok)
     print("\n" + "=" * 64)
@@ -888,6 +968,8 @@ def youtube_download() -> None:
         print(f"  {'[SUCCESS]' if ok else '[FAILED]'} {url}")
         if not ok:
             print(f"         {message}")
+    if monitor.stopped:
+        print(f"\n[STOPPED] {monitor.stop_message}")
 
 
 def cleanup_incomplete() -> None:
@@ -1007,6 +1089,7 @@ def diagnostics() -> None:
     for name, purpose in (
         ("aria2c", "Torrent and Magnet downloads"),
         ("ffmpeg", "video and audio merging/conversion"),
+        ("deno", "YouTube JavaScript challenge solving"),
     ):
         path = tool_path(name)
         print(f"  {'[OK]' if path else '[MISSING]'} {name:<8} {purpose}")
@@ -1020,12 +1103,108 @@ def diagnostics() -> None:
     except (ImportError, AttributeError):
         print("  [MISSING] yt_dlp   YouTube Python module")
     try:
+        ejs_version = importlib.metadata.version("yt-dlp-ejs")
+        print(f"  [OK] yt-dlp-ejs  YouTube challenge scripts ({ejs_version})")
+    except importlib.metadata.PackageNotFoundError:
+        print("  [MISSING] yt-dlp-ejs  Run menu 9: Refresh YouTube components")
+    try:
         import requests
         from bs4 import BeautifulSoup  # noqa: F401
 
         print(f"  [OK] requests  website mirror module ({requests.__version__})")
     except ImportError:
         print("  [MISSING] requests/bs4 website mirror modules")
+
+
+def youtube_refresh_pip_command() -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--pre",
+        "yt-dlp[default]",
+    ]
+
+
+def make_tool_available(path: str) -> None:
+    """Expose a newly installed executable to child processes in this run."""
+    directory = str(Path(path).resolve().parent)
+    current = os.environ.get("PATH", "")
+    entries = current.split(os.pathsep) if current else []
+    if directory not in entries:
+        os.environ["PATH"] = directory + (os.pathsep + current if current else "")
+
+
+def refresh_deno() -> bool:
+    """Install or update Deno without touching cookies or download state."""
+    deno = tool_path("deno")
+    if deno:
+        make_tool_available(deno)
+        print(f"[INFO] Updating Deno: {deno}")
+        return run([deno, "upgrade"])
+
+    if os.name == "nt":
+        winget = tool_path("winget")
+        if not winget:
+            print("[ERROR] Deno is missing and winget is unavailable.")
+            print("Install Microsoft App Installer, then run YouTube Refresh again.")
+            return False
+        print("[INFO] Deno is missing. Installing it with winget...")
+        installed = run([
+            winget,
+            "install",
+            "--id",
+            "DenoLand.Deno",
+            "--exact",
+            "--accept-source-agreements",
+            "--accept-package-agreements",
+            "--silent",
+        ])
+        if installed:
+            deno = tool_path("deno")
+            if deno:
+                make_tool_available(deno)
+            else:
+                print("[INFO] Reopen xGet once so Windows can load the new Deno path.")
+        return installed
+
+    print("[WARNING] Deno is not installed.")
+    print("Install Deno from https://deno.com and run YouTube Refresh again.")
+    return False
+
+
+def refresh_youtube_components() -> None:
+    print("\nYouTube Refresh")
+    print("  - Installs or updates Deno")
+    print("  - Updates yt-dlp Nightly and yt-dlp-ejs")
+    print("  - Does NOT change cookies.txt")
+    print("  - Does NOT change downloads or the resume archive")
+    if ask("Run YouTube Refresh now? (y/N)", "N").lower() != "y":
+        print("[CANCELLED] Nothing was changed.")
+        return
+
+    cookie_path = APP_DIR / "cookies.txt"
+    cookie_before = cookie_path.read_bytes() if cookie_path.is_file() else None
+    deno_ok = refresh_deno()
+
+    print("\n[INFO] Updating yt-dlp Nightly and EJS challenge scripts...")
+    ytdlp_ok = run(youtube_refresh_pip_command())
+
+    cookie_after = cookie_path.read_bytes() if cookie_path.is_file() else None
+    if cookie_before != cookie_after:
+        print("[ERROR] cookies.txt changed unexpectedly. Restore it from your backup.")
+    else:
+        print("[OK] cookies.txt was not changed.")
+
+    if deno_ok and ytdlp_ok:
+        print("\n[DONE] YouTube Refresh completed successfully.")
+        print("Return to the menu and retry the same URL.")
+    elif ytdlp_ok:
+        print("\n[PARTIAL] yt-dlp/EJS was refreshed, but Deno needs attention.")
+    else:
+        print("\n[FAILED] YouTube Refresh could not be completed.")
 
 
 def menu() -> int:
@@ -1038,6 +1217,7 @@ def menu() -> int:
         "6": resume_session,
         "7": diagnostics,
         "8": cleanup_incomplete,
+        "9": refresh_youtube_components,
     }
     while True:
         clear()
@@ -1052,6 +1232,7 @@ def menu() -> int:
         print("  6. Resume an interrupted URL-list download")
         print("  7. Check dependency status")
         print("  8. Clean incomplete download files")
+        print("  9. Refresh YouTube components (manual)")
         print("  0. Exit")
         print("=" * 64)
         choice = ask("Select a menu option")
