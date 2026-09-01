@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from pathlib import Path
@@ -21,7 +22,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse, urlunp
 
 
 APP_NAME = "xGet"
-VERSION = "2.10.0"
+VERSION = "2.11.0"
 YOUTUBE_ERROR_LIMIT = 5
 HTTP_RE = re.compile(r"^https?://", re.IGNORECASE)
 MAGNET_RE = re.compile(r"^magnet:\?xt=urn:", re.IGNORECASE)
@@ -737,12 +738,17 @@ class YoutubeRunMonitor:
     def __init__(
         self,
         error_limit: int = YOUTUBE_ERROR_LIMIT,
+        audio_format: str | None = None,
     ) -> None:
         self.error_limit = error_limit
         self.completed = 0
         self.consecutive_errors = 0
         self.stopped = False
         self.stop_message = ""
+        self.audio_format = audio_format
+        self._conversion_events: dict[str, threading.Event] = {}
+        self._conversion_started: dict[str, float] = {}
+        self._conversion_owners: dict[str, int] = {}
         self._lock = threading.Lock()
 
     def progress_hook(self, status: dict) -> None:
@@ -750,6 +756,86 @@ class YoutubeRunMonitor:
             return
         with self._lock:
             self.completed += 1
+
+    @staticmethod
+    def _item_label(info: dict) -> str:
+        index = info.get("playlist_index")
+        total = info.get("n_entries") or info.get("playlist_count")
+        if index and total:
+            return f"item {index}/{total}"
+        if index:
+            return f"item {index}"
+        return "current item"
+
+    def _conversion_heartbeat(
+        self,
+        key: str,
+        event: threading.Event,
+        label: str,
+    ) -> None:
+        spinner = "|/-\\"
+        step = 0
+        while not event.wait(1.0):
+            with self._lock:
+                started = self._conversion_started.get(key, time.monotonic())
+            elapsed = max(0, int(time.monotonic() - started))
+            minutes, seconds = divmod(elapsed, 60)
+            print(
+                f"\r[MP3 CONVERSION] {label} {spinner[step % len(spinner)]} "
+                f"working ({minutes:02d}:{seconds:02d} elapsed)   ",
+                end="",
+                flush=True,
+            )
+            step += 1
+
+    def postprocessor_hook(self, status: dict) -> None:
+        """Show MP3 conversion activity while FFmpeg is working silently."""
+        if self.audio_format != "mp3" or status.get("postprocessor") != "ExtractAudio":
+            return
+        info = status.get("info_dict") or {}
+        key = str(info.get("id") or info.get("filepath") or id(info))
+        label = self._item_label(info)
+        state = status.get("status")
+        if state == "started":
+            event = threading.Event()
+            with self._lock:
+                self._conversion_events[key] = event
+                self._conversion_started[key] = time.monotonic()
+                self._conversion_owners[key] = threading.get_ident()
+            print(f"\n[MP3 CONVERSION] {label}: 0% - FFmpeg conversion started")
+            threading.Thread(
+                target=self._conversion_heartbeat,
+                args=(key, event, label),
+                daemon=True,
+            ).start()
+        elif state == "finished":
+            with self._lock:
+                event = self._conversion_events.pop(key, None)
+                started = self._conversion_started.pop(key, time.monotonic())
+                self._conversion_owners.pop(key, None)
+            if event:
+                event.set()
+            elapsed = max(0, int(time.monotonic() - started))
+            minutes, seconds = divmod(elapsed, 60)
+            print(
+                f"\r[MP3 CONVERSION] {label}: 100% - completed "
+                f"({minutes:02d}:{seconds:02d}){' ' * 12}"
+            )
+
+    def stop_thread_conversions(self) -> None:
+        """Stop orphaned activity indicators after a conversion error."""
+        owner = threading.get_ident()
+        with self._lock:
+            keys = [key for key, value in self._conversion_owners.items() if value == owner]
+            events = [self._conversion_events.pop(key, None) for key in keys]
+            for key in keys:
+                self._conversion_started.pop(key, None)
+                self._conversion_owners.pop(key, None)
+        if any(events):
+            for event in events:
+                if event:
+                    event.set()
+            print("\r[MP3 CONVERSION] stopped because conversion did not complete.      ")
 
     def record_error(self, message: str) -> None:
         with self._lock:
@@ -843,6 +929,7 @@ def youtube_options(
     }
     if monitor:
         options["progress_hooks"] = [monitor.progress_hook]
+        options["postprocessor_hooks"] = [monitor.postprocessor_hook]
         options["logger"] = YoutubeMonitorLogger(monitor)
     if not audio_format and ffmpeg_available:
         options["merge_output_format"] = "mp4"
@@ -900,6 +987,9 @@ def download_one_youtube(
         return url, False, f"yt-dlp exit code {error_code}"
     except Exception as exc:
         return url, False, str(exc)
+    finally:
+        if monitor:
+            monitor.stop_thread_conversions()
 
 
 def youtube_download() -> None:
@@ -935,7 +1025,7 @@ def youtube_download() -> None:
         if workers > 1:
             print("[WARNING] Concurrent YouTube jobs increase the rate-limit risk.")
 
-    monitor = YoutubeRunMonitor()
+    monitor = YoutubeRunMonitor(audio_format=audio_format)
     print(f"\nTotal URLs: {len(urls)} / Concurrent jobs: {workers}")
     print(f"Destination: {output}")
     print("Fast mode: artificial request and per-video delays are disabled")
