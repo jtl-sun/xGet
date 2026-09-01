@@ -14,8 +14,17 @@ $packages = @(
 )
 
 foreach ($package in $packages) {
-    Write-Host "Installing $($package.Name)..."
-    winget install --id $package.Id --exact --accept-source-agreements --accept-package-agreements --silent
+    $installed = winget list --id $package.Id --exact --accept-source-agreements 2>$null |
+        Select-String -SimpleMatch $package.Id
+    if ($installed) {
+        Write-Host "$($package.Name): already installed" -ForegroundColor DarkGreen
+    } else {
+        Write-Host "Installing $($package.Name)..."
+        winget install --id $package.Id --exact --accept-source-agreements --accept-package-agreements --silent
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install $($package.Name)."
+        }
+    }
 }
 
 $installDir = Join-Path $env:LOCALAPPDATA "xGet"
@@ -64,6 +73,16 @@ $launcher = @"
 "@
 Set-Content -Path (Join-Path $binDir "xget.cmd") -Value $launcher -Encoding ASCII
 
+$desktop = [Environment]::GetFolderPath("Desktop")
+$shortcutPath = Join-Path $desktop "xGet.lnk"
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut($shortcutPath)
+$shortcut.TargetPath = $env:ComSpec
+$shortcut.Arguments = "/c call `"$(Join-Path $binDir 'xget.cmd')`""
+$shortcut.WorkingDirectory = $installDir
+$shortcut.Description = "xGet Integrated Downloader"
+$shortcut.Save()
+
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if (($userPath -split ";") -notcontains $binDir) {
     $newPath = if ([string]::IsNullOrWhiteSpace($userPath)) { $binDir } else { "$userPath;$binDir" }
@@ -71,5 +90,6 @@ if (($userPath -split ";") -notcontains $binDir) {
 }
 
 Write-Host ""
-Write-Host "Installation complete. Open a new terminal and enter: xget" -ForegroundColor Green
+Write-Host "Installation complete." -ForegroundColor Green
+Write-Host "Double-click the xGet shortcut on your Desktop, or enter: xget" -ForegroundColor Green
 Write-Host "Dependency check: xget --check"

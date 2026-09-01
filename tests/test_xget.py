@@ -1,5 +1,6 @@
 import importlib.util
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -63,8 +64,42 @@ class XGetTests(unittest.TestCase):
         ))
 
     def test_youtube_options_mp3(self):
-        options = xget.youtube_options(Path("/tmp/output"), "mp3", None)
+        monitor = xget.YoutubeRunMonitor(audio_format="mp3")
+        options = xget.youtube_options(Path("/tmp/output"), "mp3", None, monitor)
         self.assertEqual(options["format"], "bestaudio/best")
+        self.assertEqual(options["postprocessor_hooks"], [monitor.postprocessor_hook])
+
+    def test_mp3_conversion_progress_starts_and_finishes(self):
+        monitor = xget.YoutubeRunMonitor(audio_format="mp3")
+        info = {"id": "AbCdEf123_-", "playlist_index": 2, "n_entries": 10}
+        with patch.object(threading.Thread, "start"):
+            monitor.postprocessor_hook({
+                "status": "started", "postprocessor": "ExtractAudio", "info_dict": info,
+            })
+        self.assertIn("AbCdEf123_-", monitor._conversion_events)
+        monitor.postprocessor_hook({
+            "status": "finished", "postprocessor": "ExtractAudio", "info_dict": info,
+        })
+        self.assertNotIn("AbCdEf123_-", monitor._conversion_events)
+
+    def test_orphaned_mp3_progress_is_stopped(self):
+        monitor = xget.YoutubeRunMonitor(audio_format="mp3")
+        info = {"id": "AbCdEf123_-"}
+        with patch.object(threading.Thread, "start"):
+            monitor.postprocessor_hook({
+                "status": "started", "postprocessor": "ExtractAudio", "info_dict": info,
+            })
+        event = monitor._conversion_events["AbCdEf123_-"]
+        monitor.stop_thread_conversions()
+        self.assertTrue(event.is_set())
+        self.assertFalse(monitor._conversion_events)
+
+    def test_non_mp3_postprocessor_does_not_start_progress(self):
+        monitor = xget.YoutubeRunMonitor(audio_format="m4a")
+        monitor.postprocessor_hook({
+            "status": "started", "postprocessor": "ExtractAudio", "info_dict": {"id": "x"},
+        })
+        self.assertFalse(monitor._conversion_events)
 
     def test_youtube_options_m4a(self):
         options = xget.youtube_options(Path("/tmp/output"), "m4a", None)

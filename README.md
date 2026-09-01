@@ -1,4 +1,4 @@
-# xGet 2.10.0
+# xGet 2.11.0
 
 xGet is a menu-driven integrated terminal downloader for Windows and Ubuntu.
 
@@ -24,6 +24,9 @@ xGet is a menu-driven integrated terminal downloader for Windows and Ubuntu.
 - Keep the main menu running after an invalid file selection
 - Retry HTTP 403 responses once with a browser-style session
 - Save a successfully retrieved web page as HTML and recommend menu 3 for mirroring
+- Show MP3 conversion start, live elapsed activity, item position, and completion
+- Install on Windows by double-clicking `INSTALL-xGet.bat`
+- Create a Desktop shortcut for one-click execution
 
 ## File Picker
 
@@ -62,15 +65,19 @@ xGet/
 ## Windows Installation
 
 1. Extract the ZIP file.
-2. Open PowerShell in the extracted `xGet` directory.
-3. Run:
+2. Double-click `INSTALL-xGet.bat`.
+3. When installation finishes, double-click the **xGet** shortcut on the Desktop.
+
+The BAT installer safely starts the PowerShell installer with a one-process
+execution-policy bypass, so the red `PSSecurityException` shown when running a
+PS1 file directly does not occur. You may also install from a terminal with:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install_windows.ps1
 ```
 
-4. Close the current terminal and open a new terminal.
-5. Run:
+You may run xGet directly from the extracted folder by double-clicking
+`RUN-xGet.bat`. After installation, a terminal command also works:
 
 ```powershell
 xget
@@ -116,6 +123,11 @@ Keep `yt-dlp` current to accommodate YouTube changes.
 The default YouTube download format is M4A audio. MP4 video and MP3 audio
 remain available from the format menu. M4A is preferred directly from YouTube
 and FFmpeg finalizes the file as M4A when conversion is required.
+
+For MP3, yt-dlp continues to show the normal download percentage. When FFmpeg
+starts, xGet displays `MP3 CONVERSION`, the playlist item number, a live spinner,
+and elapsed time until it reaches `100% - completed`. This prevents a long audio
+conversion from looking like the program has stopped.
 
 Large playlists run in fast mode with no artificial delay between extraction
 requests or videos, and up to four media fragment connections. Five download
