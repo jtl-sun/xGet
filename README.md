@@ -1,4 +1,4 @@
-# xGet 2.11.0
+# xGet 2.15.0
 
 xGet is a menu-driven integrated terminal downloader for Windows and Ubuntu.
 
@@ -10,12 +10,14 @@ xGet is a menu-driven integrated terminal downloader for Windows and Ubuntu.
 - Resume interrupted downloads
 - Mirror a web page or an entire website on the same domain
 - Download YouTube videos, playlists, channels, MP3 audio, and M4A audio
-- Download multiple YouTube URLs concurrently
+- Download multiple YouTube URLs concurrently, including playlists/channels and a TXT URL batch (prefix path with `@`)
 - Automatically use a local `cookies.txt` file
 - Clean incomplete download files
 - Manually refresh Deno, yt-dlp Nightly, and EJS without changing cookies
 - Download one or multiple `.torrent` files and Magnet links concurrently
-- Automatically repair missing Python modules
+- Preview files within a single `.torrent` and choose which indexes to download
+- Save Torrent-only speed limits, seeding preferences, peer count, and concurrency
+- Manually repair YouTube components; automatically repair missing website-mirror modules
 - Mirror websites without a separate `wget.exe`
 - Download direct files and URL lists without `aria2c`
 - Select URL lists, session files, and Torrent files with the native file picker
@@ -27,6 +29,10 @@ xGet is a menu-driven integrated terminal downloader for Windows and Ubuntu.
 - Show MP3 conversion start, live elapsed activity, item position, and completion
 - Install on Windows by double-clicking `INSTALL-xGet.bat`
 - Create a Desktop shortcut for one-click execution
+- Choose and remember a custom download folder for HTTP, URL-list, YouTube, Torrent, and Magnet downloads
+- Choose and remember a separate web-mirror folder
+- Reset storage locations to the original xGet defaults at any time
+- Show download percentages in bold green three-digit format when progress can be calculated
 
 ## File Picker
 
@@ -51,9 +57,35 @@ again. Detailed aria2 diagnostics are appended to
 already existed; xGet 2.8 includes integrity/overwrite options to handle this
 case instead of silently failing.
 
-## Automatic Storage Locations
+## Torrent Controls (2.15.0)
 
-xGet creates the following directories next to `xget.py`:
+Menu **5** previews the file list in a single local `.torrent` using aria2
+`--show-files=true`. You can enter file indexes such as `1,3-5`, or press Enter
+to fetch everything. This selective mode is available only for **one local
+`.torrent` file at a time**. Multi-torrent and Magnet jobs still work; Magnet
+metadata is saved when available, but selecting individual files directly from
+a Magnet URL is not supported until you have a local `.torrent`. Because Torrent
+pieces can span file boundaries, aria2 may write small portions of unselected
+files. xGet does not automatically remove these.
+
+Menu **11** saves Torrent-only options in `xget-settings.json`:
+
+- Concurrent Torrent jobs (1-10, defaults to 3; never exceeds supplied job count)
+- Overall Torrent download/upload speed limits (`0` is unlimited, e.g., `500K` or `2M`)
+- Seeding time in minutes (`0` means stop seeding after completion, legacy behavior)
+- Seeding ratio (default 1.0 when seeding is enabled)
+- Maximum peers per Torrent (default 55)
+
+The options apply to new aria2 Torrent/Magnet runs, not YouTube downloads.
+Existing data is hash-checked. Stop with Ctrl+C and use the same source and
+download folder to resume. Do not move or delete `.aria2` resume state files:
+xGet now excludes them from menu 8 cleanup. aria2 remains a terminal downloader;
+xGet does not claim to reproduce the complete qBittorrent/uTorrent GUI,
+background task manager, or live queue reordering.
+
+## Storage Locations
+
+By default, xGet keeps the same storage layout used by earlier releases:
 
 ```text
 xGet/
@@ -61,6 +93,17 @@ xGet/
 ├── downloads/   Direct files, URL lists, YouTube, Torrent, and Magnet downloads
 └── home/        Mirrored web pages and websites
 ```
+
+Use **menu 10 - Set storage locations** to choose a different folder. The
+download folder and web-mirror folder can be configured separately. xGet saves
+the selection in `xget-settings.json` and uses it on later runs. Changing a
+location does **not** move or delete existing files. Resetting the setting
+returns xGet to the default folders above.
+
+The YouTube resume archive (`.xget-youtube-archive.txt`), URL-list session file,
+and aria2 log are kept inside the currently selected download folder so resume
+behavior follows the chosen destination. `cookies.txt` remains beside `xget.py`
+and is not changed by storage settings.
 
 ## Windows Installation
 
@@ -103,6 +146,8 @@ xget
 7. Check dependency status
 8. Clean incomplete download files
 9. Refresh YouTube components (manual)
+10. Set storage locations
+11. Set Torrent preferences (limits, seeding, peers)
 0. Exit
 ```
 
@@ -117,6 +162,12 @@ Respect each website's terms of service and copyright requirements.
 
 ## YouTube Downloads
 
+For a large **multi-file** batch, enter several YouTube URLs separated by
+spaces/commas, use the multiline input mode, supply a playlist/channel URL,
+or input `@/path/to/youtube-urls.txt` at the first URL prompt. Completed IDs
+continue to be archived. The job scheduler starts only 1-2 URL tasks at once
+and does not queue all URLs ahead of the five-error stop rule.
+
 Use this feature only for content that you own or are authorized to download.
 Keep `yt-dlp` current to accommodate YouTube changes.
 
@@ -124,10 +175,12 @@ The default YouTube download format is M4A audio. MP4 video and MP3 audio
 remain available from the format menu. M4A is preferred directly from YouTube
 and FFmpeg finalizes the file as M4A when conversion is required.
 
-For MP3, yt-dlp continues to show the normal download percentage. When FFmpeg
-starts, xGet displays `MP3 CONVERSION`, the playlist item number, a live spinner,
-and elapsed time until it reaches `100% - completed`. This prevents a long audio
-conversion from looking like the program has stopped.
+For direct HTTP downloads and YouTube transfers, xGet shows progress in bold
+green three-digit form such as `007 %`, `054 %`, and `100 %`. If an HTTP server
+does not provide a usable total size, xGet displays `--- %` rather than inventing
+a percentage. When FFmpeg starts an MP3 conversion, xGet displays
+`MP3 CONVERSION`, the playlist item number, live activity, and completion status
+so a long conversion does not look like the program has stopped.
 
 Large playlists run in fast mode with no artificial delay between extraction
 requests or videos, and up to four media fragment connections. Five download
@@ -191,3 +244,67 @@ chmod +x uninstall_ubuntu.sh
 - Follow the target website's terms, copyright restrictions, and local laws.
 - Use Torrent support only for content that you own or may legally distribute.
 - VPN management is not included. Use a separate trusted VPN application when required.
+
+## 2.14.0 Ubuntu parity update (2026-10-02)
+
+Windows and Ubuntu install the identical `xget.py`, with one runtime `VERSION`
+constant. There is no separate Ubuntu core. Both report 2.14.0.
+
+Extract `xGet-2.14.0-English.zip`, open a terminal in the extracted folder, and run:
+
+```bash
+bash ./install_ubuntu.sh
+~/.local/bin/xget --version
+~/.local/bin/xget
+```
+
+Expected version output: `xget.py 2.14.0`.
+The installer replaces `~/.local/share/xget/xget.py` and the launcher, uses
+`~/.local/share/xget/venv/bin/python`, upgrades `yt-dlp[default]`, checks EJS and
+FFmpeg, installs a missing/unsupported Deno, and compares the launcher's version
+with the source release. Deno must be at least 2.3.0, per the current upstream
+EJS requirements: https://github.com/yt-dlp/yt-dlp/wiki/EJS .
+No shell reload is needed for Deno. Supported discovery locations include PATH,
+`~/.deno/bin/deno` (preferred on Ubuntu), `/usr/local/bin/deno`, and `/usr/bin/deno`.
+If `xget` is not on PATH, use `~/.local/bin/xget` or add `~/.local/bin` to PATH.
+An older `.venv` is retained for preservation but the new launcher uses `venv`.
+
+Existing cookies, archives, sessions, settings and downloads are preserved.
+Source cookies are copied only if no installed cookie file exists. The Ubuntu
+uninstaller removes only the launcher and core, preserving data and environments.
+The Windows installer also keeps existing cookies on reinstallation.
+
+Menu 9 remains manual and confirms before updating. It upgrades Deno and
+`yt-dlp[default]` (including EJS) in the current interpreter, then prints component
+versions and readiness. Restart xGet after refreshing so newly installed Python
+modules are loaded. Refresh performs no deletion of user data.
+Menu 4 checks yt-dlp, FFmpeg, supported Deno and EJS before asking for URLs.
+HTTP 403 diagnostics show installed component versions, possible causes and menu 9
+guidance; they never refresh automatically. They cannot determine that a component
+is the latest release without querying the network.
+
+Menu 10 saves download and mirror paths in `xget-settings.json`; paths with spaces
+are supported. An unavailable destination produces a warning and requires explicit
+consent before using the default for that operation. The saved preference remains
+unchanged. Conventional external mounts under `/mnt/<drive>`,
+`/media/<user>/<drive>` and `/run/media/<user>/<drive>` are checked before creating
+directories, preventing writes beneath an absent mount. For nonstandard custom
+mount layouts, ensure the volume is mounted before starting xGet.
+
+No fixed YouTube request/per-video sleeps are configured. Four concurrent fragments,
+five accumulated logged errors, successful-item archiving, completed-item skipping,
+HTTP, URL lists, mirrors, Torrent/Magnet and resume behavior remain supported.
+
+Validation: Python 3.12 compilation and 46 unittest tests passed on Windows.
+Ubuntu/WSL was unavailable on the build machine: shell installer execution and
+live Ubuntu MP4/M4A/MP3 downloads remain unverified. This package does not itself
+update an Ubuntu machine; run the installer there and verify the version output.
+
+## 2.15.0 Torrent controls and batch YouTube reliability (2026-11-01)
+
+Based on xGet 2.14.0. Both Windows and Ubuntu install the same xget.py core.
+Torrent preview/select, persistent transfer limits, optional seeding and peer
+controls were added without replacing aria2 or yt-dlp. Multi-URL and playlist
+YouTube downloading, auto-resume archive, cookies and manual component refresh
+are preserved. This build was tested with mock subprocesses and local unit
+tests. Live Windows/Ubuntu Torrent and YouTube transfers need user testing.

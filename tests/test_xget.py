@@ -182,7 +182,7 @@ class XGetTests(unittest.TestCase):
             xget.make_tool_available("/opt/deno/bin/deno")
             self.assertEqual(
                 xget.os.environ["PATH"].split(xget.os.pathsep)[0],
-                "/opt/deno/bin",
+                str(Path("/opt/deno/bin/deno").resolve().parent),
             )
 
     def test_youtube_refresh_is_manual_and_can_be_cancelled(self):
@@ -219,6 +219,41 @@ class XGetTests(unittest.TestCase):
     def test_automatic_output_directories(self):
         self.assertEqual(xget.downloads_dir(), xget.APP_DIR / "downloads")
         self.assertEqual(xget.home_dir(), xget.APP_DIR / "home")
+
+
+    def test_storage_settings_save_and_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_file = Path(directory) / "xget-settings.json"
+            with patch.object(xget, "SETTINGS_FILE", settings_file):
+                self.assertTrue(xget.save_settings({"download_dir": str(Path(directory) / "media")}))
+                loaded = xget.load_settings()
+                self.assertEqual(loaded["download_dir"], str(Path(directory) / "media"))
+
+    def test_corrupt_storage_settings_fall_back_safely(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_file = Path(directory) / "xget-settings.json"
+            settings_file.write_text("{broken-json", encoding="utf-8")
+            with patch.object(xget, "SETTINGS_FILE", settings_file):
+                self.assertEqual(xget.load_settings(), {})
+
+    def test_custom_download_and_mirror_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings_file = root / "xget-settings.json"
+            download = root / "My Downloads"
+            mirror = root / "My Mirrors"
+            settings_file.write_text(
+                '{"download_dir": %r, "mirror_dir": %r}' % (str(download), str(mirror)),
+                encoding="utf-8",
+            )
+            # Rewrite with json to keep Windows paths valid when tests run there.
+            import json
+            settings_file.write_text(json.dumps({"download_dir": str(download), "mirror_dir": str(mirror)}), encoding="utf-8")
+            with patch.object(xget, "SETTINGS_FILE", settings_file):
+                self.assertEqual(xget.downloads_dir(False), download)
+                self.assertEqual(xget.home_dir(False), mirror)
+                self.assertTrue(download.is_dir())
+                self.assertTrue(mirror.is_dir())
 
     def test_onedrive_viewer_url_conversion(self):
         source = (

@@ -1,0 +1,51 @@
+name: Publish xGet 2.15.0
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: contains(github.event.head_commit.message, 'xGet 2.15.0')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Run source tests
+        run: |
+          python3 -m py_compile xget.py tests/test_xget.py tests/test_ubuntu_update.py tests/test_torrent_upgrade.py
+          python3 -m unittest discover -s tests -v
+          bash -n install_ubuntu.sh uninstall_ubuntu.sh
+      - name: Build public source package
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile, ZIP_DEFLATED
+          items = [
+              ".gitignore", "INSTALL-xGet.bat", "RUN-xGet.bat",
+              "install_ubuntu.sh", "install_windows.ps1",
+              "uninstall_ubuntu.sh", "uninstall_windows.ps1",
+              "xget.py", "README.md", "xGet-DEVELOPMENT-HANDOFF.md",
+              "urls.example.txt", "tests/test_xget.py",
+              "tests/test_ubuntu_update.py", "tests/test_torrent_upgrade.py",
+          ]
+          with ZipFile("xGet-2.15.0-English.zip", "w", ZIP_DEFLATED) as archive:
+              for item in items:
+                  path = Path(item)
+                  if not path.is_file():
+                      raise FileNotFoundError(item)
+                  archive.write(path, arcname=item)
+          PY
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v2.15.0 xGet-2.15.0-English.zip \
+            --target "$GITHUB_SHA" \
+            --title "xGet 2.15.0" \
+            --notes "Adds configurable Torrent limits, file selection and stronger resume preservation. Maintains multi-URL, playlist and channel YouTube downloads and the 5-error stop safeguard. Includes Windows and Ubuntu installers; 58 automated tests."
