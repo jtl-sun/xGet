@@ -7,6 +7,7 @@ import argparse
 import glob
 import hashlib
 import importlib.metadata
+import json
 import os
 import posixpath
 import re
@@ -15,18 +16,32 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from collections import deque
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse, urlunparse
 
 
 APP_NAME = "xGet"
-VERSION = "2.11.0"
+VERSION = "2.15.0"
+DENO_MIN_VERSION = (2, 3, 0)
 YOUTUBE_ERROR_LIMIT = 5
 HTTP_RE = re.compile(r"^https?://", re.IGNORECASE)
 MAGNET_RE = re.compile(r"^magnet:\?xt=urn:", re.IGNORECASE)
 APP_DIR = Path(__file__).resolve().parent
+def green_bold(text: str) -> str:
+    """Return bold green terminal text when ANSI output is supported."""
+    return f"\033[1;32m{text}\033[0m"
+
+
+def progress_text(value: float | int | None) -> str:
+    """Format a real percentage as three digits; unknown progress stays honest."""
+    if value is None:
+        return "--- %"
+    percent = max(0, min(100, int(round(float(value)))))
+    return f"{percent:03d} %"
+
+
 ARIA2_EXIT_MESSAGES = {
     3: "The requested resource was not found.",
     6: "A network error occurred.",
@@ -53,18 +68,34 @@ def clear() -> None:
 
 
 def pause() -> None:
-    input("\nPress Enter to return to the menu...")
+    try:
+        input("\nPress Enter to return to the menu...")
+    except (KeyboardInterrupt, EOFError):
+        print("\n[INFO] Returning to the menu.")
 
 
 def tool_path(name: str) -> str | None:
+    try:
+        return _tool_path(name)
+    except OSError:
+        # An inaccessible optional installation directory is not a fatal error.
+        return None
+
+
+def _tool_path(name: str) -> str | None:
+    if os.name != "nt" and name.lower() == "deno":
+        # A manual refresh may install a user binary when system upgrade is denied.
+        local = Path.home() / ".deno/bin/deno"
+        if local.is_file() and os.access(local, os.X_OK):
+            return str(local)
     found = shutil.which(name) or (shutil.which(f"{name}.exe") if os.name == "nt" else None)
     if found:
         return found
     if os.name != "nt":
         if name.lower() == "deno":
-            local_deno = Path.home() / ".deno" / "bin" / "deno"
-            if local_deno.is_file():
-                return str(local_deno)
+            for local_deno in (Path.home() / ".deno/bin/deno", Path("/usr/local/bin/deno"), Path("/usr/bin/deno")):
+                if local_deno.is_file() and os.access(local_deno, os.X_OK):
+                    return str(local_deno)
         return None
     if name.lower() in {"aria2c", "deno"}:
         local_app_data = os.environ.get("LOCALAPPDATA")
@@ -91,40 +122,61 @@ def require_tool(name: str, purpose: str) -> str | None:
     return path
 
 
-def get_youtube_dl(auto_install: bool = True):
-    """Import yt_dlp and repair a missing installation in the active Python."""
+def get_youtube_dl(auto_install: bool = False):
+    """Load YouTube support; dependency changes are manual only."""
     try:
         from yt_dlp import YoutubeDL
-
         return YoutubeDL
     except ImportError:
-        if not auto_install:
-            return None
-
-    print("\n[INSTALL] The 'yt_dlp' module is missing. Installing it automatically.")
-    print(f"[Python] {sys.executable}")
-    try:
-        command = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            "--pre",
-            "yt-dlp[default]",
-        ]
-        result = subprocess.run(command, check=False)
-        if result.returncode != 0:
-            print(f"\n[ERROR] Automatic yt_dlp installation failed. Exit code: {result.returncode}")
-            print("Check your internet connection and run install_windows.ps1 again.")
-            return None
-        from yt_dlp import YoutubeDL
-
-        print("[DONE] yt_dlp was installed successfully.")
-        return YoutubeDL
-    except (ImportError, OSError) as exc:
-        print(f"\n[ERROR] Could not install or load yt_dlp: {exc}")
         return None
+
+
+def deno_version(path: str | None = None) -> str | None:
+    path = path or tool_path("deno")
+    if not path:
+        return None
+    try:
+        result = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10)
+        match = re.search(r"deno (\d+\.\d+\.\d+)", result.stdout)
+        if result.returncode == 0 and match:
+            return match.group(1)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def youtube_environment() -> dict:
+    """Read local component versions without network access or installations."""
+    status = {"Deno": deno_version(), "FFmpeg": tool_path("ffmpeg")}
+    for label, package in (("yt-dlp", "yt-dlp"), ("EJS", "yt-dlp-ejs")):
+        try:
+            status[label] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            status[label] = None
+    return status
+
+
+def youtube_preflight() -> bool:
+    status = youtube_environment()
+    version = status["Deno"]
+    supported = bool(version and tuple(map(int, version.split("."))) >= DENO_MIN_VERSION)
+    for label, value in status.items():
+        print(f"[{'OK' if value else 'MISSING'}] {label}: {value or 'not available'}")
+    if not supported or not status["EJS"]:
+        print("[WARNING] YouTube JavaScript runtime is not ready. Deno >= 2.3.0 and EJS are required.")
+    ready = supported and all(status.values()) and get_youtube_dl() is not None
+    if not ready:
+        print("Run menu 9: Refresh YouTube components. Install FFmpeg with the installer if missing.")
+    return bool(ready)
+
+
+def youtube_403_guidance(message: str) -> None:
+    if re.search(r"(?:HTTP(?: Error)?\s*403|403.*Forbidden)", message, re.I):
+        print("[ERROR] YouTube returned HTTP 403.")
+        print("Possible causes: outdated yt-dlp; missing/outdated Deno; missing EJS components; cookies/session issue.")
+        for label, value in youtube_environment().items():
+            print(f"[INFO] {label}: {value or 'missing'}")
+        print("Recommended action: Run menu 9: Refresh YouTube components.")
 
 
 def ensure_web_modules():
@@ -261,19 +313,168 @@ def read_sources_from_keyboard(label: str) -> list[str]:
     return sources
 
 
-def app_output_dir(name: str) -> Path:
-    path = APP_DIR / name
-    path.mkdir(parents=True, exist_ok=True)
-    print(f"Destination: {path}")
+SETTINGS_FILE = APP_DIR / "xget-settings.json"
+
+
+def default_download_dir() -> Path:
+    """Return the legacy-compatible default download directory."""
+    return APP_DIR / "downloads"
+
+
+def default_home_dir() -> Path:
+    return APP_DIR / "home"
+
+
+def load_settings() -> dict:
+    """Load user settings. A broken settings file never prevents xGet from starting."""
+    if not SETTINGS_FILE.is_file():
+        return {}
+    try:
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+
+
+def save_settings(settings: dict) -> bool:
+    """Atomically save settings so an interrupted write cannot corrupt the config."""
+    try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp = SETTINGS_FILE.with_suffix(SETTINGS_FILE.suffix + ".tmp")
+        temp.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temp.replace(SETTINGS_FILE)
+        return True
+    except OSError as exc:
+        print(f"[ERROR] Could not save xGet settings: {exc}")
+        return False
+
+
+def configured_path(key: str, fallback: Path) -> Path:
+    raw = load_settings().get(key)
+    if isinstance(raw, str) and raw.strip():
+        return Path(os.path.expandvars(raw)).expanduser()
+    return fallback
+
+
+def ensure_output_dir(path: Path, announce: bool = True) -> Path:
+    try:
+        if os.name != "nt":
+            parts = path.absolute().parts
+            mount = None
+            if len(parts) >= 3 and parts[1] == "mnt":
+                mount = Path(*parts[:3])
+            elif len(parts) >= 4 and parts[1] in {"media", "run"}:
+                count = 5 if parts[1:3] == ("run", "media") else 4
+                mount = Path(*parts[:count])
+            if mount and path not in (default_download_dir(), default_home_dir()) and not os.path.ismount(mount):
+                raise OSError(f"Configured drive/mount is unavailable: {mount}")
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise OSError(f"Cannot create or use destination folder '{path}': {exc}") from exc
+    if not path.is_dir():
+        raise OSError(f"Destination is not a directory: {path}")
+    if announce:
+        print(f"Destination: {path}")
     return path
 
 
-def downloads_dir() -> Path:
-    return app_output_dir("downloads")
+def storage_dir(key: str, fallback: Path, announce: bool = True) -> Path:
+    path = configured_path(key, fallback)
+    try:
+        return ensure_output_dir(path, announce)
+    except OSError as exc:
+        print(f"[WARNING] {exc}")
+        if path != fallback and ask(f"Use default folder {fallback}? (y/N)", "N").lower() == "y":
+            return ensure_output_dir(fallback, announce)
+        raise
 
 
-def home_dir() -> Path:
-    return app_output_dir("home")
+def downloads_dir(announce: bool = True) -> Path:
+    return storage_dir("download_dir", default_download_dir(), announce)
+
+
+def home_dir(announce: bool = True) -> Path:
+    return storage_dir("mirror_dir", default_home_dir(), announce)
+
+
+def choose_directory(title: str, initial: Path | None = None) -> str:
+    """Open a native folder picker, with keyboard entry as a fallback."""
+    root = None
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        selected = filedialog.askdirectory(
+            parent=root,
+            title=title,
+            initialdir=str(initial) if initial and initial.exists() else None,
+            mustexist=False,
+        )
+        if selected:
+            print(f"Selected folder: {selected}")
+            return selected
+        print("[CANCELLED] No folder was selected.")
+        return ""
+    except Exception as exc:
+        print(f"[INFO] The graphical folder picker is unavailable: {exc}")
+        return ask("Enter the complete destination folder path")
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+
+def set_storage_locations() -> None:
+    """Configure persistent storage folders without moving or deleting existing files."""
+    settings = load_settings()
+    current_download = configured_path("download_dir", default_download_dir())
+    current_mirror = configured_path("mirror_dir", default_home_dir())
+    print("\nStorage locations")
+    print(f"  Downloads : {current_download}")
+    print(f"  Web mirror: {current_mirror}")
+    print("\n  1. Change download folder (HTTP, lists, YouTube, Torrent/Magnet)")
+    print("  2. Change web-mirror folder")
+    print("  3. Reset both locations to xGet defaults")
+    print("  0. Cancel")
+    choice = ask("Select", "1")
+    if choice == "0":
+        print("[CANCELLED] Storage locations were not changed.")
+        return
+    if choice == "3":
+        settings.pop("download_dir", None)
+        settings.pop("mirror_dir", None)
+        if save_settings(settings):
+            print(f"[DONE] Download folder reset to: {default_download_dir()}")
+            print(f"[DONE] Web-mirror folder reset to: {default_home_dir()}")
+        return
+    if choice not in {"1", "2"}:
+        print("[ERROR] Select 1, 2, 3, or 0.")
+        return
+    key = "download_dir" if choice == "1" else "mirror_dir"
+    current = current_download if choice == "1" else current_mirror
+    selected = choose_directory("Select xGet destination folder", current)
+    if not selected:
+        return
+    path = Path(os.path.expandvars(selected)).expanduser()
+    try:
+        path = ensure_output_dir(path, announce=False).resolve()
+        # Verify that the chosen folder is writable without leaving a probe behind.
+        probe = path / ".xget-write-test.tmp"
+        probe.write_bytes(b"xget")
+        probe.unlink()
+    except OSError as exc:
+        print(f"[ERROR] The selected folder cannot be used: {exc}")
+        return
+    settings[key] = str(path)
+    if save_settings(settings):
+        label = "Download" if key == "download_dir" else "Web-mirror"
+        print(f"[DONE] {label} folder saved: {path}")
+        print("[INFO] Existing files were not moved or deleted.")
 
 
 def valid_http_url(url: str) -> bool:
@@ -323,28 +524,180 @@ def aria2_base(output: Path) -> list[str] | None:
 
 
 def add_torrent_options(
-    command: list[str], sources: list[str], concurrent: int, output: Path | None = None
+    command: list[str], sources: list[str], concurrent: int, output: Path | None = None,
+    preferences: dict | None = None, selected_files: str | None = None,
 ) -> list[str]:
-    """Return one aria2 command that schedules multiple Torrent jobs."""
+    """Return one resumable aria2 command that schedules multiple Torrent jobs."""
+    settings = dict(torrent_preferences() if preferences is None else preferences)
+    settings["torrent_concurrent"] = concurrent
     torrent_options = [
-        "--seed-time=0",
         "--bt-enable-lpd=true",
         "--enable-dht=true",
         "--enable-peer-exchange=true",
-        # Existing files are validated against Torrent piece hashes. Complete
-        # files are kept; incomplete/corrupt data is repaired or downloaded.
+        "--bt-save-metadata=true",  # Preserve fetched Magnet metadata for later use.
+        # Verify already present pieces, rather than overwriting good downloads.
         "--check-integrity=true",
+        "--continue=true",
         "--allow-overwrite=true",
         "--auto-file-renaming=false",
         "--bt-hash-check-seed=false",
-        f"--max-concurrent-downloads={concurrent}",
+        "--bt-remove-unselected-file=false",  # Never automatically delete files.
+        *torrent_runtime_options(settings),
     ]
+    if selected_files is not None:
+        if len(sources) != 1 or not sources[0].lower().endswith(".torrent"):
+            raise ValueError("File selection is supported only for a single local .torrent file")
+        validated_selection = parse_torrent_file_selection(selected_files)
+        if validated_selection:
+            torrent_options.append(f"--select-file={validated_selection}")
     if output is not None:
         torrent_options.extend([
             f"--log={output / 'xget-aria2.log'}",
             "--log-level=notice",
         ])
     return command + torrent_options + sources
+
+
+# User-adjustable Torrent controls, inspired by useful download-manager options.
+# They are applied to aria2, not to YouTube or direct HTTP downloads.
+TORRENT_DEFAULTS = {
+    "torrent_concurrent": 3,
+    "torrent_download_limit": "0",
+    "torrent_upload_limit": "0",
+    "torrent_seed_time": 0,
+    "torrent_seed_ratio": "1.0",
+    "torrent_max_peers": 55,
+}
+
+
+def validate_torrent_setting(key: str, value: object) -> object:
+    """Normalize a Torrent setting or raise ValueError for unsafe/invalid input."""
+    if key not in TORRENT_DEFAULTS:
+        raise ValueError(f"Unknown Torrent setting: {key}")
+    raw = str(value).strip()
+    if key in {"torrent_download_limit", "torrent_upload_limit"}:
+        if not re.fullmatch(r"(?:0|[1-9]\d{0,8}(?:[KkMm])?)", raw):
+            raise ValueError("Enter 0 (unlimited), or a speed such as 500K or 2M")
+        return raw.upper()
+    if key == "torrent_seed_ratio":
+        try:
+            ratio = float(raw)
+        except ValueError as exc:
+            raise ValueError("Seed ratio must be a number from 0 to 100") from exc
+        if not 0 <= ratio <= 100 or not (ratio < float("inf")):
+            raise ValueError("Seed ratio must be a number from 0 to 100")
+        return f"{ratio:g}"
+    if not raw.isascii() or not raw.isdecimal():
+        raise ValueError("Enter a whole number")
+    number = int(raw)
+    limits = {
+        "torrent_concurrent": (1, 10),
+        "torrent_seed_time": (0, 10080),
+        "torrent_max_peers": (1, 1000),
+    }
+    minimum, maximum = limits[key]
+    if not minimum <= number <= maximum:
+        raise ValueError(f"Value must be between {minimum} and {maximum}")
+    return number
+
+
+def torrent_preferences() -> dict:
+    saved = load_settings()
+    preferences = dict(TORRENT_DEFAULTS)
+    for key in TORRENT_DEFAULTS:
+        if key in saved:
+            try:
+                preferences[key] = validate_torrent_setting(key, saved[key])
+            except ValueError:
+                print(f"[WARNING] Invalid saved {key}; using safe default")
+    return preferences
+
+
+def configure_torrent_preferences() -> None:
+    """Persist torrent-only controls without touching other download settings."""
+    labels = (
+        ("torrent_concurrent", "Concurrent Torrent jobs (1-10)"),
+        ("torrent_download_limit", "Overall Torrent download speed (0/500K/2M)"),
+        ("torrent_upload_limit", "Overall Torrent upload speed (0/100K/1M)"),
+        ("torrent_seed_time", "Seed duration in minutes (0 = no seeding)"),
+        ("torrent_seed_ratio", "Seed ratio limit (e.g. 1.0)"),
+        ("torrent_max_peers", "Maximum peers per Torrent (1-1000)"),
+    )
+    current = torrent_preferences()
+    print("\nTorrent preferences (aria2) — press Enter to keep each value")
+    proposed = {}
+    for key, label in labels:
+        value = ask(label, str(current[key]))
+        try:
+            proposed[key] = validate_torrent_setting(key, value)
+        except ValueError as exc:
+            print(f"[ERROR] {label}: {exc}. No settings were changed.")
+            return
+    print("\nSettings affect future Torrent jobs only. Download files will not be modified.")
+    if ask("Save Torrent preferences? (y/N)", "N").lower() != "y":
+        print("[CANCELLED] Torrent preferences were not changed.")
+        return
+    updated = load_settings()
+    updated.update(proposed)
+    if save_settings(updated):
+        print("[DONE] Torrent preferences saved in xget-settings.json")
+
+
+def torrent_runtime_options(preferences: dict) -> list[str]:
+    """Construct aria2 options from validated settings, not arbitrary CLI text."""
+    values = {
+        key: validate_torrent_setting(key, preferences.get(key, default))
+        for key, default in TORRENT_DEFAULTS.items()
+    }
+    return [
+        f"--max-concurrent-downloads={values['torrent_concurrent']}",
+        f"--max-overall-download-limit={values['torrent_download_limit']}",
+        f"--max-overall-upload-limit={values['torrent_upload_limit']}",
+        f"--seed-time={values['torrent_seed_time']}",
+        f"--seed-ratio={values['torrent_seed_ratio']}",
+        f"--bt-max-peers={values['torrent_max_peers']}",
+    ]
+
+
+def torrent_file_preview(aria2: str, torrent: str) -> bool:
+    """Show verified .torrent metadata without downloading any payload."""
+    print(f"\n[TORRENT FILES] {torrent}")
+    try:
+        result = subprocess.run(
+            [aria2, "--show-files=true", torrent],
+            capture_output=True, text=True, errors="replace", timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"[WARNING] Cannot inspect Torrent metadata: {exc}")
+        return False
+    if result.returncode:
+        print(f"[WARNING] Could not read Torrent metadata: {(result.stderr or result.stdout).strip()[:500]}")
+        return False
+    print(result.stdout.strip() or "(No file details returned)")
+    return True
+
+
+def valid_magnet_uri(source: str) -> bool:
+    """Accept Magnet URIs irrespective of their query-parameter order."""
+    parsed = urlparse(source.strip())
+    if parsed.scheme.lower() != "magnet":
+        return False
+    xt_values = parse_qs(parsed.query, keep_blank_values=False).get("xt", [])
+    return any(re.match(r"^urn:(?:btih|btmh):[^\s&]+$", xt, re.IGNORECASE) for xt in xt_values)
+
+
+def parse_torrent_file_selection(value: str) -> str | None:
+    """Accept aria2 file indexes like 1,3,5-8; blank selects all files."""
+    if not value.strip():
+        return None
+    compact = re.sub(r"\s+", "", value)
+    if not re.fullmatch(r"[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*", compact):
+        raise ValueError("Use file indexes such as 1,3,5-8 (or Enter for all)")
+    for segment in compact.split(","):
+        parts = segment.split("-")
+        if any(int(item) < 1 for item in parts) or (len(parts) == 2 and int(parts[0]) > int(parts[1])):
+            raise ValueError("Torrent file indexes must be positive, ascending numbers")
+    return compact
 
 
 def convert_cloud_download_url(url: str) -> str:
@@ -469,11 +822,14 @@ def download_http_file(url: str, output: Path) -> tuple[bool, str]:
                     if total:
                         percent = downloaded * 100 / total
                         status = (
-                            f"\rDownloading {filename}: {percent:6.2f}% "
+                            f"\r{green_bold('[DOWNLOAD] ' + progress_text(percent))} - {filename} "
                             f"({format_bytes(downloaded)} / {format_bytes(total)})"
                         )
                     else:
-                        status = f"\rDownloading {filename}: {format_bytes(downloaded)}"
+                        status = (
+                            f"\r{green_bold('[DOWNLOAD] ' + progress_text(None))} - {filename} "
+                            f"({format_bytes(downloaded)})"
+                        )
                     print(status, end="", flush=True)
             print()
             if target.exists():
@@ -641,8 +997,7 @@ def website_clone() -> None:
 
     while queue and len(visited_pages) < page_limit:
         page_url = clean_url(queue.popleft())
-        if page_url in visited_pages:
-            continue
+        if page_url in visited_pages:            continue
         visited_pages.add(page_url)
         try:
             response = session.get(page_url, timeout=30)
@@ -701,6 +1056,7 @@ def website_clone() -> None:
 def read_youtube_urls() -> list[str]:
     print("\nYou can enter multiple URLs separated by commas or spaces.")
     print("Press Enter without typing a URL to use multi-line input mode.")
+    print("Or enter @/path/to/youtube-urls.txt to load a large URL list.")
     first = ask("YouTube URL")
     raw_lines: list[str] = []
     if first:
@@ -715,13 +1071,24 @@ def read_youtube_urls() -> list[str]:
             raw_lines.append(line)
             index += 1
 
+    # A plain TXT file of URLs is convenient for very large batches; avoid
+    # treating it as a command to execute. Prefix the path with @.
+    if len(raw_lines) == 1 and raw_lines[0].startswith("@"):
+        file_path = Path(raw_lines[0][1:].strip().strip('"')).expanduser()
+        try:
+            raw_lines = read_text_lines(file_path)
+            print(f"[INFO] Loaded {len(raw_lines)} URL line(s) from {file_path}")
+        except (OSError, ValueError) as exc:
+            print(f"[ERROR] Could not read YouTube URL list: {exc}")
+            return []
     candidates = re.split(r"[,\s]+", "\n".join(raw_lines).strip())
-    urls = [
-        value
-        for value in candidates
-        if value and valid_http_url(value)
-        and ("youtube.com" in value.lower() or "youtu.be" in value.lower())
-    ]
+    urls = []
+    for value in candidates:
+        if not value or not valid_http_url(value):
+            continue
+        host = (urlparse(value).hostname or "").lower()
+        if host in {"youtube.com", "youtu.be"} or host.endswith(".youtube.com"):
+            urls.append(value)
     rejected = len([value for value in candidates if value]) - len(urls)
     if rejected:
         print(f"[INFO] Ignored {rejected} item(s) that were not valid YouTube URLs.")
@@ -752,8 +1119,31 @@ class YoutubeRunMonitor:
         self._lock = threading.Lock()
 
     def progress_hook(self, status: dict) -> None:
-        if status.get("status") != "finished":
+        state = status.get("status")
+        info = status.get("info_dict") or {}
+        label = self._item_label(info)
+        if state == "downloading":
+            downloaded = status.get("downloaded_bytes") or 0
+            total = status.get("total_bytes") or status.get("total_bytes_estimate")
+            percent = (downloaded * 100 / total) if total else None
+            extras = []
+            speed = status.get("speed")
+            eta = status.get("eta")
+            if speed:
+                extras.append(f"{format_bytes(int(speed))}/s")
+            if eta is not None:
+                minutes, seconds = divmod(max(0, int(eta)), 60)
+                extras.append(f"ETA {minutes:02d}:{seconds:02d}")
+            suffix = f" | {' | '.join(extras)}" if extras else ""
+            print(
+                f"\r{green_bold('[DOWNLOAD] ' + progress_text(percent))} - {label}{suffix}   ",
+                end="",
+                flush=True,
+            )
             return
+        if state != "finished":
+            return
+        print(f"\r{green_bold('[DOWNLOAD] ' + progress_text(100))} - {label}{' ' * 18}")
         with self._lock:
             self.completed += 1
 
@@ -802,7 +1192,7 @@ class YoutubeRunMonitor:
                 self._conversion_events[key] = event
                 self._conversion_started[key] = time.monotonic()
                 self._conversion_owners[key] = threading.get_ident()
-            print(f"\n[MP3 CONVERSION] {label}: 0% - FFmpeg conversion started")
+            print(f"\n{green_bold('[MP3 CONVERSION] ' + progress_text(0))} - {label} | FFmpeg conversion started")
             threading.Thread(
                 target=self._conversion_heartbeat,
                 args=(key, event, label),
@@ -818,7 +1208,7 @@ class YoutubeRunMonitor:
             elapsed = max(0, int(time.monotonic() - started))
             minutes, seconds = divmod(elapsed, 60)
             print(
-                f"\r[MP3 CONVERSION] {label}: 100% - completed "
+                f"\r{green_bold('[MP3 CONVERSION] ' + progress_text(100))} - {label} | completed "
                 f"({minutes:02d}:{seconds:02d}){' ' * 12}"
             )
 
@@ -863,6 +1253,7 @@ class YoutubeMonitorLogger:
 
     def error(self, message: str) -> None:
         print(message, file=sys.stderr)
+        youtube_403_guidance(message)
         self.monitor.record_error(message)
 
 
@@ -924,9 +1315,12 @@ def youtube_options(
         "writethumbnail": False,
         "writesubtitles": False,
         "postprocessors": postprocessors,
-        "quiet": False,
+        "quiet": True,
         "no_warnings": False,
     }
+    deno = tool_path("deno")
+    if deno:
+        options["js_runtimes"] = {"deno": {"path": deno}}
     if monitor:
         options["progress_hooks"] = [monitor.progress_hook]
         options["postprocessor_hooks"] = [monitor.postprocessor_hook]
@@ -986,6 +1380,7 @@ def download_one_youtube(
             return url, True, "Completed"
         return url, False, f"yt-dlp exit code {error_code}"
     except Exception as exc:
+        youtube_403_guidance(str(exc))
         return url, False, str(exc)
     finally:
         if monitor:
@@ -993,7 +1388,7 @@ def download_one_youtube(
 
 
 def youtube_download() -> None:
-    if not get_youtube_dl():
+    if not youtube_preflight():
         return
     urls = read_youtube_urls()
     if not urls:
@@ -1031,25 +1426,40 @@ def youtube_download() -> None:
     print("Fast mode: artificial request and per-video delays are disabled")
     print(f"Auto-stop: after {monitor.error_limit} download errors")
     results: list[tuple[str, bool, str]] = []
+    # Admit no more than 'workers' URLs at a time. Submitting the entire list
+    # up front would allow queued jobs to start after the error limit trips.
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(
-                download_one_youtube,
-                url,
-                output,
-                audio_format,
-                cookie_file,
-                index,
-                monitor,
-            ): url
-            for index, url in enumerate(urls, 1)
-        }
-        for future in as_completed(futures):
-            results.append(future.result())
+        next_item = iter(enumerate(urls, 1))
+        active = {}
+
+        def submit_one() -> bool:
             if monitor.stopped:
-                for pending in futures:
-                    pending.cancel()
+                return False
+            try:
+                index, url = next(next_item)
+            except StopIteration:
+                return False
+            job = executor.submit(
+                download_one_youtube, url, output, audio_format, cookie_file, index, monitor
+            )
+            active[job] = url
+            return True
+
+        for _ in range(workers):
+            if not submit_one():
                 break
+        while active:
+            completed_jobs, _ = wait(tuple(active), return_when=FIRST_COMPLETED)
+            for future in completed_jobs:
+                url = active.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = (url, False, f"Unexpected worker error: {exc}")
+                results.append(result)
+            if not monitor.stopped:
+                for _ in completed_jobs:
+                    submit_one()
 
     success = sum(1 for _, ok, _ in results if ok)
     print("\n" + "=" * 64)
@@ -1067,7 +1477,9 @@ def cleanup_incomplete() -> None:
     if not target.is_dir():
         print("[ERROR] The directory was not found.")
         return
-    patterns = ("*.part", "*.ytdl", "*.temp", "*.part-Frag*", "*.aria2")
+    # .aria2 control files are essential for resuming interrupted Torrent jobs.
+    # Do not remove them through ordinary cleanup.
+    patterns = ("*.part", "*.ytdl", "*.temp", "*.part-Frag*")
     matches: list[Path] = []
     for pattern in patterns:
         matches.extend(Path(item) for item in glob.glob(str(target / "**" / pattern), recursive=True))
@@ -1103,18 +1515,21 @@ def torrent_download(selected_source: str | None = None) -> None:
             sources = read_sources_from_keyboard("Magnet URL")
         elif source_type == "2":
             sources = read_sources_from_keyboard("Torrent file path")
-        else:
+        elif source_type == "3":
             sources = choose_files(
                 "Select Torrent files (Ctrl/Shift selects multiple)",
                 [("Torrent files", "*.torrent"), ("All files", "*.*")],
             )
+        else:
+            print("[ERROR] Invalid Torrent source selection")
+            return
     if not sources:
         print("[CANCELLED] No Torrent or Magnet source was entered.")
         return
 
     resolved_sources: list[str] = []
     for source in dict.fromkeys(sources):
-        if MAGNET_RE.match(source):
+        if valid_magnet_uri(source):
             resolved_sources.append(source)
             continue
         torrent_path = Path(source).expanduser()
@@ -1126,20 +1541,45 @@ def torrent_download(selected_source: str | None = None) -> None:
         print("[ERROR] No valid Magnet URL or .torrent file remains.")
         return
 
-    concurrent_default = str(min(3, len(resolved_sources)))
+    preferences = torrent_preferences()
+    concurrent_default = str(min(preferences["torrent_concurrent"], len(resolved_sources)))
     concurrent_raw = ask("Concurrent Torrent jobs (1-10)", concurrent_default)
-    concurrent = max(
-        1,
-        min(10, int(concurrent_raw) if concurrent_raw.isdigit() else int(concurrent_default)),
-    )
+    try:
+        concurrent = validate_torrent_setting("torrent_concurrent", concurrent_raw)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}")
+        return
     output = downloads_dir()
     command = aria2_base(output)
     if not command:
         return
-    command = add_torrent_options(command, resolved_sources, concurrent, output)
+
+    selected_files: str | None = None
+    if len(resolved_sources) == 1 and resolved_sources[0].lower().endswith(".torrent"):
+        if torrent_file_preview(command[0], resolved_sources[0]):
+            print("[INFO] To download only certain files, enter their INDEX numbers above.")
+            try:
+                selected_files = parse_torrent_file_selection(ask("File indexes (Enter = all)", ""))
+            except ValueError as exc:
+                print(f"[ERROR] {exc}. Download was cancelled.")
+                return
+    elif len(resolved_sources) == 1 and valid_magnet_uri(resolved_sources[0]):
+        print("[INFO] Magnet file selection needs metadata first. All files are selected.")
+        print("[INFO] Fetched Magnet metadata will be saved for reuse when available.")
+    else:
+        print("[INFO] Batch mode: downloading all files in each Torrent.")
+        print("[INFO] For selective download, open a single .torrent file.")
+
+    command = add_torrent_options(
+        command, resolved_sources, concurrent, output,
+        preferences=preferences, selected_files=selected_files,
+    )
     print(f"[INFO] Torrent sources: {len(resolved_sources)} / Concurrent jobs: {concurrent}")
-    print("[INFO] Existing files will be hash-checked; only missing or damaged data is downloaded.")
+    print("[INFO] Existing files are hash-checked; missing/damaged data can be resumed.")
+    print(f"[INFO] Download cap: {preferences['torrent_download_limit']} | Upload cap: {preferences['torrent_upload_limit']}")
+    print(f"[INFO] Seed time: {preferences['torrent_seed_time']} min | Ratio: {preferences['torrent_seed_ratio']}")
     print(f"[INFO] aria2 log: {output / 'xget-aria2.log'}")
+    print("[INFO] Press Ctrl+C to stop; use the same Torrent/Magnet and folder to resume later.")
     run(command)
 
 
@@ -1233,7 +1673,12 @@ def refresh_deno() -> bool:
     if deno:
         make_tool_available(deno)
         print(f"[INFO] Updating Deno: {deno}")
-        return run([deno, "upgrade"])
+        if run([deno, "upgrade"]):
+            version = deno_version(deno)
+            if version and tuple(map(int, version.split("."))) >= DENO_MIN_VERSION:
+                return True
+        if os.name == "nt":
+            return False
 
     if os.name == "nt":
         winget = tool_path("winget")
@@ -1260,8 +1705,24 @@ def refresh_deno() -> bool:
                 print("[INFO] Reopen xGet once so Windows can load the new Deno path.")
         return installed
 
-    print("[WARNING] Deno is not installed.")
-    print("Install Deno from https://deno.com and run YouTube Refresh again.")
+    # Use a user-owned installation even when a system binary cannot upgrade.
+    import tempfile
+    from urllib.request import urlopen
+    try:
+        with urlopen("https://deno.land/install.sh", timeout=30) as response:
+            script = response.read()
+        with tempfile.TemporaryDirectory() as directory:
+            installer = Path(directory) / "install-deno.sh"
+            installer.write_bytes(script)
+            env = dict(os.environ, DENO_INSTALL=str(Path.home() / ".deno"))
+            result = subprocess.run(["sh", str(installer), "--no-modify-path"], env=env)
+        local = Path.home() / ".deno/bin/deno"
+        version = deno_version(str(local))
+        if result.returncode == 0 and version and tuple(map(int, version.split("."))) >= DENO_MIN_VERSION:
+            make_tool_available(str(local))
+            return True
+    except (OSError, ValueError) as exc:
+        print(f"[ERROR] Deno installation failed: {exc}")
     return False
 
 
@@ -1288,11 +1749,12 @@ def refresh_youtube_components() -> None:
     else:
         print("[OK] cookies.txt was not changed.")
 
-    if deno_ok and ytdlp_ok:
+    ready = youtube_preflight()
+    if deno_ok and ytdlp_ok and ready:
         print("\n[DONE] YouTube Refresh completed successfully.")
         print("Return to the menu and retry the same URL.")
     elif ytdlp_ok:
-        print("\n[PARTIAL] yt-dlp/EJS was refreshed, but Deno needs attention.")
+        print("\n[PARTIAL] Components were updated, but the environment is not ready. See diagnostics above.")
     else:
         print("\n[FAILED] YouTube Refresh could not be completed.")
 
@@ -1308,12 +1770,17 @@ def menu() -> int:
         "7": diagnostics,
         "8": cleanup_incomplete,
         "9": refresh_youtube_components,
+        "10": set_storage_locations,
+        "11": configure_torrent_preferences,
     }
     while True:
         clear()
         print("=" * 64)
         print(f"  {APP_NAME} {VERSION} - Integrated Terminal Downloader")
         print("=" * 64)
+        print(f"  Download folder: {configured_path('download_dir', default_download_dir())}")
+        print(f"  Mirror folder  : {configured_path('mirror_dir', default_home_dir())}")
+        print("-" * 64)
         print("  1. Download a direct HTTP/HTTPS file")
         print("  2. Download files from a URL list")
         print("  3. Mirror a web page or website")
@@ -1323,6 +1790,8 @@ def menu() -> int:
         print("  7. Check dependency status")
         print("  8. Clean incomplete download files")
         print("  9. Refresh YouTube components (manual)")
+        print(" 10. Set storage locations")
+        print(" 11. Set Torrent preferences (limits, seeding, peers)")
         print("  0. Exit")
         print("=" * 64)
         choice = ask("Select a menu option")

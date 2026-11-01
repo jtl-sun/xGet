@@ -26,3 +26,7 @@ cookies.txt
 .vscode/
 .DS_Store
 Thumbs.db
+
+
+# User-specific downloader preferences
+xget-settings.json

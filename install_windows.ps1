@@ -33,7 +33,7 @@ $venvDir = Join-Path $installDir ".venv"
 New-Item -ItemType Directory -Force -Path $installDir, $binDir | Out-Null
 
 Copy-Item (Join-Path $PSScriptRoot "xget.py") (Join-Path $installDir "xget.py") -Force
-if (Test-Path (Join-Path $PSScriptRoot "cookies.txt")) {
+if ((Test-Path (Join-Path $PSScriptRoot "cookies.txt")) -and -not (Test-Path (Join-Path $installDir "cookies.txt"))) {
     Copy-Item (Join-Path $PSScriptRoot "cookies.txt") (Join-Path $installDir "cookies.txt") -Force
 }
 
@@ -88,6 +88,14 @@ if (($userPath -split ";") -notcontains $binDir) {
     $newPath = if ([string]::IsNullOrWhiteSpace($userPath)) { $binDir } else { "$userPath;$binDir" }
     [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
 }
+
+# Verify the installed entry point executes the same release as this package.
+$sourceVersion = (& $venvPython (Join-Path $PSScriptRoot "xget.py") --version | Out-String).Trim()
+$installedVersion = (& $venvPython (Join-Path $installDir "xget.py") --version | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $sourceVersion -ne $installedVersion) {
+    throw "xGet version mismatch after installation: source=$sourceVersion installed=$installedVersion"
+}
+Write-Host "Installed xGet version: $installedVersion" -ForegroundColor Green
 
 Write-Host ""
 Write-Host "Installation complete." -ForegroundColor Green
