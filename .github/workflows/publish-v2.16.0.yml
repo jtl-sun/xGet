@@ -17,6 +17,13 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+      - name: Set up Python for reproducible CI
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install HTTP and mirror dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check requests beautifulsoup4
       - name: Validate code and installer
         run: |
           python3 -m py_compile xget.py tests/test_xget.py tests/test_ubuntu_update.py tests/test_torrent_upgrade.py tests/test_http_torrent_216.py
