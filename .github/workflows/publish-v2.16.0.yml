@@ -1,1 +1,61 @@
-The requested file reference is not currently visible. Use files.search or files.list to rediscover the file, then retry with a returned ref_id or file_id.
+name: Publish xGet 2.16.0
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, 'Release xGet 2.16.0')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Validate code and installer
+        run: |
+          python3 -m py_compile xget.py tests/test_xget.py tests/test_ubuntu_update.py tests/test_torrent_upgrade.py tests/test_http_torrent_216.py
+          python3 -m unittest discover -s tests -v
+          bash -n install_ubuntu.sh uninstall_ubuntu.sh
+      - name: Package Windows and Ubuntu source release
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          from zipfile import ZipFile, ZIP_DEFLATED
+          files = [
+              ".gitignore", "INSTALL-xGet.bat", "RUN-xGet.bat",
+              "install_ubuntu.sh", "install_windows.ps1",
+              "uninstall_ubuntu.sh", "uninstall_windows.ps1",
+              "xget.py", "README.md", "xGet-DEVELOPMENT-HANDOFF.md",
+              "urls.example.txt", "tests/test_xget.py",
+              "tests/test_ubuntu_update.py", "tests/test_torrent_upgrade.py",
+              "tests/test_http_torrent_216.py",
+          ]
+          with ZipFile("xGet-2.16.0-English.zip", "w", ZIP_DEFLATED, compresslevel=9) as archive:
+              for name in files:
+                  item = Path(name)
+                  if not item.is_file():
+                      raise FileNotFoundError(item)
+                  archive.write(item, arcname=name)
+          with ZipFile("xGet-2.16.0-English.zip") as archive:
+              if archive.testzip() is not None:
+                  raise ValueError("ZIP integrity verification failed")
+          PYCODE
+          sha256sum xGet-2.16.0-English.zip > xGet-2.16.0-English.zip.sha256
+      - name: Publish or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v2.16.0 >/dev/null 2>&1; then
+            gh release upload v2.16.0 xGet-2.16.0-English.zip xGet-2.16.0-English.zip.sha256 --clobber
+          else
+            gh release create v2.16.0 xGet-2.16.0-English.zip xGet-2.16.0-English.zip.sha256 \
+              --target "$GITHUB_SHA" \
+              --title "xGet 2.16.0" \
+              --notes "Improves HTTP retries, partial download resume, Torrent v1/v2 detection and optional qBittorrent handoff while preserving multi-item YouTube downloads. 67 automated tests."
+          fi
