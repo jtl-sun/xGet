@@ -1,4 +1,4 @@
-# xGet 2.15.0 Development Handoff
+# xGet 2.16.0 Development Handoff
 
 Date: 2026-11-01. Source: user-provided xGet-2.14.0-English.zip.
 This document replaces the stale handoff bundled with that ZIP. GitHub state and
@@ -6,10 +6,10 @@ installed Ubuntu state were not inspected or changed.
 
 ## Current release
 
-The single xget.py core defines VERSION = "2.15.0". Windows and Ubuntu installers
+The single xget.py core defines VERSION = "2.16.0". Windows and Ubuntu installers
 copy that same file. Ubuntu launcher executes ~/.local/share/xget/venv/bin/python
 with ~/.local/share/xget/xget.py and forwards all quoted arguments. Menu header,
-CLI, installer verification, README and release ZIP agree on 2.15.0.
+CLI, installer verification, README and release ZIP agree on 2.16.0.
 Older release numbers are historical, not alternate runtime versions.
 
 ## Changes
@@ -92,3 +92,18 @@ xget.py tests/test_xget.py tests/test_ubuntu_update.py tests/test_torrent_upgrad
 Do live verification on Windows/Ubuntu with permitted legal downloads. The
 portable qBittorrent/uTorrent installers supplied for reference were NOT
 executed, embedded, or redistributed.
+
+## 2.16.0 (2026-11-23)
+
+Core release following 2.15.0: detect bencoded v1, v2-only and hybrid Torrent
+metadata and Magnet hash types. v2-only transfers can be explicitly handed off
+to an already installed qBittorrent GUI using `--save-path=<folder>`; this does
+not mean the transfer completed. aria2 continues to serve v1/hybrid downloads;
+its exit logs include troubleshooting hints. HTTP downloads now reject HTML
+masquerading as installers, retry temporary HTTP errors, and resume partial
+files only with a matching ETag/Last-Modified validator and a valid 206 response.
+YouTube multi-item functionality remains unchanged.
+
+No existing cookies, sessions, downloads, `.aria2` state or configuration are
+removed by installation. Test with `python3 -m unittest discover -s tests -v`.
+Do not claim live HTTP or peer connectivity tests from offline mocks.

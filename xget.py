@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse, urlunp
 
 
 APP_NAME = "xGet"
-VERSION = "2.15.0"
+VERSION = "2.16.0"
 DENO_MIN_VERSION = (2, 3, 0)
 YOUTUBE_ERROR_LIMIT = 5
 HTTP_RE = re.compile(r"^https?://", re.IGNORECASE)
@@ -700,6 +700,152 @@ def parse_torrent_file_selection(value: str) -> str | None:
     return compact
 
 
+def inspect_torrent_version(path: Path) -> str:
+    """Identify v1, v2-only or hybrid metainfo without installing a decoder.
+
+    Refuse oversized/untrusted bencoded inputs rather than loading an arbitrary
+    amount of memory or recursing indefinitely. Detection never modifies files.
+    """
+    try:
+        if path.stat().st_size > 16 * 1024 * 1024:
+            return "unknown"
+        blob = path.read_bytes()
+    except OSError:
+        return "unknown"
+    position = 0
+    budget = [100000]
+
+    def parse(depth: int = 0):
+        nonlocal position
+        budget[0] -= 1
+        if budget[0] < 0 or depth > 64 or position >= len(blob):
+            raise ValueError("Invalid torrent metadata")
+        kind = blob[position:position + 1]
+        position += 1
+        if kind == b"i":
+            end = blob.find(b"e", position)
+            if end < 0 or end - position > 24:
+                raise ValueError("Malformed bencode integer")
+            value = int(blob[position:end])
+            position = end + 1
+            return value
+        if kind == b"l":
+            entries = []
+            while position < len(blob) and blob[position:position + 1] != b"e":
+                entries.append(parse(depth + 1))
+            if position >= len(blob):
+                raise ValueError("Unterminated list")
+            position += 1
+            return entries
+        if kind == b"d":
+            entries = {}
+            while position < len(blob) and blob[position:position + 1] != b"e":
+                key = parse(depth + 1)
+                if not isinstance(key, bytes):
+                    raise ValueError("Invalid dictionary key")
+                entries[key] = parse(depth + 1)
+            if position >= len(blob):
+                raise ValueError("Unterminated dictionary")
+            position += 1
+            return entries
+        if b"0" <= kind <= b"9":
+            colon = blob.find(b":", position - 1)
+            if colon < 0 or colon - position > 19:
+                raise ValueError("Invalid string length")
+            length = int(blob[position - 1:colon])
+            position = colon + 1
+            if length < 0 or length > len(blob) - position:
+                raise ValueError("Out-of-bounds metadata string")
+            value = blob[position:position + length]
+            position += length
+            return value
+        raise ValueError("Unknown bencode element")
+
+    try:
+        root = parse()
+        if position != len(blob) or not isinstance(root, dict):
+            return "invalid"
+        info = root.get(b"info")
+        if not isinstance(info, dict):
+            return "invalid"
+        if info.get(b"meta version") == 2:
+            return "hybrid" if isinstance(info.get(b"pieces"), bytes) else "v2"
+        return "v1" if isinstance(info.get(b"pieces"), bytes) else "unknown"
+    except (ValueError, TypeError, RecursionError, OverflowError):
+        return "invalid"
+
+
+def magnet_version(uri: str) -> str:
+    """Interpret v1 (btih), v2 (btmh), and hybrid magnet hashes."""
+    try:
+        hashes = parse_qs(urlparse(uri).query).get("xt", [])
+    except ValueError:
+        return "unknown"
+    v1 = any(h.lower().startswith("urn:btih:") for h in hashes)
+    v2 = any(h.lower().startswith("urn:btmh:") for h in hashes)
+    return "hybrid" if v1 and v2 else ("v2" if v2 else ("v1" if v1 else "unknown"))
+
+
+def find_qbittorrent() -> str | None:
+    """Locate an installed qBittorrent GUI; do not install or start a daemon."""
+    override = os.environ.get("XGET_QBITTORRENT", "")
+    if override:
+        candidate = Path(os.path.expandvars(override)).expanduser()
+        if candidate.is_file():
+            return str(candidate)
+    found = shutil.which("qbittorrent") or shutil.which("qbittorrent.exe")
+    if found:
+        return found
+    if os.name == "nt":
+        for root in (os.environ.get("PROGRAMFILES"), os.environ.get("PROGRAMFILES(X86)")):
+            if root:
+                candidate = Path(root) / "qBittorrent" / "qbittorrent.exe"
+                if candidate.is_file():
+                    return str(candidate)
+    return None
+
+
+def handoff_to_qbittorrent(sources: list[str], output: Path) -> bool:
+    """Explicit user-selected handoff; qBittorrent controls actual transfer."""
+    executable = find_qbittorrent()
+    if not executable:
+        print("[ERROR] qBittorrent was not found. Install it from https://www.qbittorrent.org/")
+        print("[INFO] Portable users can set XGET_QBITTORRENT to the qbittorrent.exe path.")
+        return False
+    try:
+        subprocess.Popen(
+            [executable, f"--save-path={output}", *sources],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=(os.name != "nt"),
+        )
+    except OSError as exc:
+        print(f"[ERROR] Could not open qBittorrent: {exc}")
+        return False
+    print(f"[HANDOFF] Sent {len(sources)} source(s) to qBittorrent. Destination: {output}")
+    print("[INFO] Transfer progress, peers, and completion are managed in qBittorrent.")
+    return True
+
+
+def aria2_torrent_guidance(log_path: Path) -> None:
+    """Explain common aria2 failures without pretending to know the root cause."""
+    try:
+        with log_path.open("rb") as log:
+            log.seek(max(0, log.seek(0, 2) - 16_384))
+            tail = log.read().decode("utf-8", "replace").lower()
+    except OSError:
+        tail = ""
+    if "bencode" in tail or "unsupported" in tail or "errorcode=25" in tail:
+        print("[HINT] Metadata could be corrupt, unsupported, or BitTorrent v2-only.")
+        print("[HINT] Retry with a verified .torrent or use a current qBittorrent client.")
+    elif "timeout" in tail or "tracker" in tail and "failed" in tail:
+        print("[HINT] Tracker/DHT connectivity may be blocked or the swarm may be unavailable.")
+        print("[HINT] Check firewall, UDP/DHT access and network policies; retry later.")
+    else:
+        print("[HINT] Check the log, peer/seed availability, Tracker/DHT, and disk space.")
+        print("[HINT] Some Torrent v2-only content requires qBittorrent/libtorrent.")
+    print(f"[HINT] aria2 log: {log_path}")
+
+
 def convert_cloud_download_url(url: str) -> str:
     """Convert supported cloud-viewer URLs into direct-download URLs."""
     parsed = urlparse(url)
@@ -758,15 +904,13 @@ def browser_headers(url: str) -> dict[str, str]:
     }
 
 
-def open_http_response(session, url: str):
-    """Request a URL and retry a 403 once after establishing a site session."""
+def open_http_response(session, url: str, extra_headers: dict | None = None):
+    """Follow redirects and retry a 403 after a normal browser-like site visit."""
     headers = browser_headers(url)
+    if extra_headers:
+        headers.update(extra_headers)
     response = session.get(
-        url,
-        stream=True,
-        timeout=(20, 120),
-        allow_redirects=True,
-        headers=headers,
+        url, stream=True, timeout=(20, 120), allow_redirects=True, headers=headers,
     )
     if response.status_code != 403:
         return response
@@ -779,76 +923,201 @@ def open_http_response(session, url: str):
     except Exception:
         pass
     return session.get(
-        url,
-        stream=True,
-        timeout=(20, 120),
-        allow_redirects=True,
-        headers=browser_headers(url),
+        url, stream=True, timeout=(20, 120), allow_redirects=True, headers=headers,
     )
 
 
+INSTALLER_SUFFIXES = {
+    ".exe", ".msi", ".msix", ".appx", ".zip", ".7z", ".rar",
+    ".deb", ".rpm", ".dmg", ".pkg", ".iso", ".apk", ".tar",
+    ".gz", ".xz", ".whl", ".AppImage".lower(),
+}
+
+
+def unexpected_html_file(url: str, filename: str, content_type: str) -> bool:
+    """Never silently save a login/error page as a requested installer/archive."""
+    if "text/html" not in content_type.lower():
+        return False
+    request_suffix = Path(urlparse(url).path).suffix.lower()
+    result_suffix = Path(filename).suffix.lower()
+    return request_suffix in INSTALLER_SUFFIXES or result_suffix in INSTALLER_SUFFIXES
+
+
+def http_retry_wait(response, attempt: int) -> float:
+    """Honor Retry-After seconds with an upper bound to avoid endless waiting."""
+    value = response.headers.get("retry-after", "").strip()
+    if value.isdigit():
+        return min(10.0, max(0.0, float(value)))
+    return min(8.0, 2 ** attempt)
+
+
 def download_http_file(url: str, output: Path) -> tuple[bool, str]:
+    """Download a file with bounded retries and safe, validator-backed resume.
+
+    The .part file survives failures. Resume uses If-Range with the original ETag
+    or Last-Modified header and accepts only a matching HTTP 206 response.
+    """
     modules = ensure_web_modules()
     if not modules:
         return False, "The HTTP download modules are unavailable."
     requests, _ = modules
     requested_url = convert_cloud_download_url(url)
     try:
-        session = requests.Session()
-        with open_http_response(session, requested_url) as response:
-            if response.status_code == 403:
-                return False, (
-                    "403 Forbidden after a browser-style retry. The website may require "
-                    "sign-in or may block automated downloads. Open the page in a browser "
-                    "and use its public file-download link."
-                )
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "").lower()
-            filename = response_filename(response, requested_url)
-            if "text/html" in content_type and not Path(filename).suffix:
-                filename += ".html"
-            elif "text/html" in content_type and filename == "download.bin":
-                filename = "index.html"
-            target = output / filename
-            part = target.with_name(target.name + ".part")
-            total = int(response.headers.get("content-length", "0") or 0)
-            downloaded = 0
-            with part.open("wb") as stream:
-                for chunk in response.iter_content(chunk_size=1024 * 256):
-                    if not chunk:
+        output.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, f"Download directory is not writable: {exc}"
+    session = requests.Session()
+    last_error = "Download failed."
+    for attempt in range(3):
+        try:
+            with open_http_response(session, requested_url) as response:
+                if response.status_code == 403:
+                    return False, (
+                        "403 Forbidden: the site may require authentication or block automated "
+                        "downloads. Use its official direct file URL; xGet cannot bypass logins."
+                    )
+                if response.status_code in (408, 429, 500, 502, 503, 504):
+                    last_error = f"HTTP {response.status_code} (temporary server/rate-limit error)"
+                    if attempt < 2:
+                        time.sleep(http_retry_wait(response, attempt))
                         continue
-                    stream.write(chunk)
-                    downloaded += len(chunk)
-                    if total:
-                        percent = downloaded * 100 / total
-                        status = (
-                            f"\r{green_bold('[DOWNLOAD] ' + progress_text(percent))} - {filename} "
-                            f"({format_bytes(downloaded)} / {format_bytes(total)})"
-                        )
-                    else:
-                        status = (
-                            f"\r{green_bold('[DOWNLOAD] ' + progress_text(None))} - {filename} "
-                            f"({format_bytes(downloaded)})"
-                        )
-                    print(status, end="", flush=True)
-            print()
-            if target.exists():
-                stem, suffix = target.stem, target.suffix
-                index = 1
-                while target.exists():
-                    target = output / f"{stem} ({index}){suffix}"
-                    index += 1
-            part.replace(target)
-            if "text/html" in content_type:
-                return True, f"Web page saved as HTML: {target}. Use menu 3 for a full mirror."
-            return True, str(target)
-    except KeyboardInterrupt:
-        print()
-        return False, "Download interrupted. The .part file was kept."
-    except Exception as exc:
-        print()
-        return False, str(exc)
+                    return False, last_error
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "").lower()
+                filename = response_filename(response, requested_url)
+                if unexpected_html_file(requested_url, filename, content_type):
+                    return False, (
+                        "The server returned HTML instead of the expected software/archive. "
+                        "This may be a download page, login, or anti-bot challenge. "
+                        "Use the site's direct download link."
+                    )
+                if "text/html" in content_type and not Path(filename).suffix:
+                    filename += ".html"
+                elif "text/html" in content_type and filename == "download.bin":
+                    filename = "index.html"
 
+                target = output / filename
+                part = output / (filename + ".part")
+                sidecar = output / (filename + ".part.json")
+                etag = response.headers.get("etag")
+                modified = response.headers.get("last-modified")
+                total = int(response.headers.get("content-length", "0") or 0)
+                offset = 0
+                validator = etag or modified
+                if part.is_file() and sidecar.is_file() and validator:
+                    try:
+                        old = json.loads(sidecar.read_text(encoding="utf-8"))
+                        size = part.stat().st_size
+                        if (
+                            old.get("url") == requested_url and old.get("filename") == filename
+                            and old.get("validator") == validator
+                            and size > 0 and (not total or size < total)
+                        ):
+                            offset = size
+                    except (OSError, ValueError, TypeError):
+                        pass
+                if offset:
+                    response.close()
+                    with open_http_response(
+                        session, requested_url,
+                        {"Range": f"bytes={offset}-", "If-Range": validator},
+                    ) as resumed:
+                        if resumed.status_code == 206:
+                            range_value = resumed.headers.get("content-range", "")
+                            match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", range_value, re.I)
+                            if not match:
+                                return False, "Invalid Content-Range from server; partial data kept."
+                            first, last, full_size = (int(x) for x in match.groups())
+                            if (
+                                first != offset or last < first or last >= full_size
+                                or (total and full_size != total)
+                                or (resumed.headers.get("content-length", "").isdigit()
+                                    and int(resumed.headers["content-length"]) != last - first + 1)
+                            ):
+                                return False, "Conflicting Content-Range from server; partial data kept."
+                            if etag and resumed.headers.get("etag") and resumed.headers["etag"] != etag:
+                                return False, "ETag changed during resume; partial data kept."
+                            return _write_http_stream(
+                                resumed, target, part, sidecar, requested_url, filename,
+                                validator, offset, full_size,
+                            )
+                        if resumed.status_code == 200:
+                            # Server ignored Range, or If-Range detected a changed file.
+                            # Restart from zero, never append unrelated bytes.
+                            return _write_http_stream(
+                                resumed, target, part, sidecar, requested_url, filename,
+                                resumed.headers.get("etag") or resumed.headers.get("last-modified"),
+                                0, int(resumed.headers.get("content-length", "0") or 0),
+                            )
+                        if resumed.status_code in (408, 429, 500, 502, 503, 504):
+                            last_error = f"HTTP {resumed.status_code} during resume"
+                            if attempt < 2:
+                                time.sleep(http_retry_wait(resumed, attempt))
+                                continue
+                            return False, last_error
+                        resumed.raise_for_status()
+                        return False, f"Resume rejected: HTTP {resumed.status_code}. Partial data kept."
+                return _write_http_stream(
+                    response, target, part, sidecar, requested_url, filename,
+                    validator, 0, total,
+                )
+        except KeyboardInterrupt:
+            print()
+            return False, "Download interrupted. Partial data was kept."
+        except (requests.exceptions.RequestException, OSError, ValueError) as exc:
+            last_error = str(exc)
+            if attempt < 2:
+                time.sleep(min(8, 2 ** attempt))
+                continue
+    return False, f"Download failed after 3 attempts: {last_error}. Partial data was kept."
+
+
+def _write_http_stream(
+    response, target: Path, part: Path, sidecar: Path,
+    url: str, filename: str, validator: str | None, offset: int, total: int,
+) -> tuple[bool, str]:
+    """Write only to a .part file, then atomically finalize after size checks."""
+    expected = total or 0
+    if offset and expected and offset > expected:
+        return False, "Partial file exceeds expected size. Nothing was overwritten."
+    sidecar.write_text(json.dumps({
+        "url": url, "filename": filename, "validator": validator,
+    }), encoding="utf-8")
+    downloaded = offset
+    with part.open("ab" if offset else "wb") as stream:
+        for chunk in response.iter_content(chunk_size=1024 * 256):
+            if not chunk:
+                continue
+            stream.write(chunk)
+            downloaded += len(chunk)
+            if expected:
+                info = f"{format_bytes(downloaded)} / {format_bytes(expected)}"
+                pct = progress_text(downloaded * 100 / expected)
+            else:
+                info, pct = format_bytes(downloaded), progress_text(None)
+            print(
+                f"\r{green_bold('[DOWNLOAD] ' + pct)} - {filename} ({info})",
+                end="", flush=True,
+            )
+    print()
+    if expected and downloaded != expected:
+        raise OSError(
+            f"Server sent {downloaded} bytes, expected {expected}; saved for resume"
+        )
+    if target.exists():
+        stem, suffix = target.stem, target.suffix
+        n = 1
+        while target.exists():
+            target = target.with_name(f"{stem} ({n}){suffix}")
+            n += 1
+    part.replace(target)
+    try:
+        sidecar.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if "text/html" in response.headers.get("content-type", "").lower():
+        return True, f"Web page saved as HTML: {target}. Use menu 3 to mirror pages."
+    return True, str(target)
 
 def direct_download() -> None:
     url = ask("Direct HTTP/HTTPS file or public sharing URL")
@@ -997,7 +1266,8 @@ def website_clone() -> None:
 
     while queue and len(visited_pages) < page_limit:
         page_url = clean_url(queue.popleft())
-        if page_url in visited_pages:            continue
+        if page_url in visited_pages:
+            continue
         visited_pages.add(page_url)
         try:
             response = session.get(page_url, timeout=30)
@@ -1541,6 +1811,29 @@ def torrent_download(selected_source: str | None = None) -> None:
         print("[ERROR] No valid Magnet URL or .torrent file remains.")
         return
 
+    # aria2 can process traditional v1 torrents, but v2-only metadata may
+    # fail. Avoid a costly download that cannot possibly parse the source.
+    source_versions = [
+        magnet_version(source) if valid_magnet_uri(source)
+        else inspect_torrent_version(Path(source))
+        for source in resolved_sources
+    ]
+    for source, version in zip(resolved_sources, source_versions):
+        print(f"[TORRENT] {version.upper()} — {source[:150]}")
+    if "invalid" in source_versions:
+        print("[ERROR] A .torrent file is malformed or not a real torrent. No job started.")
+        return
+    if "v2" in source_versions:
+        print("[WARNING] BitTorrent v2-only input may be incompatible with aria2.")
+        print("[INFO] qBittorrent/libtorrent can handle BitTorrent v2.")
+        if ask("Send these Torrent sources to qBittorrent? (y/N)", "N").lower() == "y":
+            handoff_to_qbittorrent(resolved_sources, downloads_dir())
+        else:
+            print("[CANCELLED] No Torrent job started. Your files were not changed.")
+        return
+    if "hybrid" in source_versions:
+        print("[INFO] Hybrid Torrent found; aria2 may use its v1 compatibility data.")
+
     preferences = torrent_preferences()
     concurrent_default = str(min(preferences["torrent_concurrent"], len(resolved_sources)))
     concurrent_raw = ask("Concurrent Torrent jobs (1-10)", concurrent_default)
@@ -1580,7 +1873,8 @@ def torrent_download(selected_source: str | None = None) -> None:
     print(f"[INFO] Seed time: {preferences['torrent_seed_time']} min | Ratio: {preferences['torrent_seed_ratio']}")
     print(f"[INFO] aria2 log: {output / 'xget-aria2.log'}")
     print("[INFO] Press Ctrl+C to stop; use the same Torrent/Magnet and folder to resume later.")
-    run(command)
+    if not run(command):
+        aria2_torrent_guidance(output / "xget-aria2.log")
 
 
 def resume_session() -> None:
@@ -1625,6 +1919,15 @@ def diagnostics() -> None:
         print(f"  {'[OK]' if path else '[MISSING]'} {name:<8} {purpose}")
         if path:
             print(f"           {path}")
+            if name == "aria2c":
+                try:
+                    version_result = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=5)
+                    found = re.search(r"aria2 version (\d+\.\d+\.\d+)", version_result.stdout)
+                    if found:
+                        print(f"           aria2 version: {found.group(1)}")
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+    print(f"  {'[OK]' if find_qbittorrent() else '[OPTIONAL]'} qBittorrent  BitTorrent v2 handoff")
     try:
         import yt_dlp
         from yt_dlp.version import __version__ as ytdlp_version

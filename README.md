@@ -1,4 +1,4 @@
-# xGet 2.15.0
+# xGet 2.16.0
 
 xGet is a menu-driven integrated terminal downloader for Windows and Ubuntu.
 
@@ -308,3 +308,39 @@ controls were added without replacing aria2 or yt-dlp. Multi-URL and playlist
 YouTube downloading, auto-resume archive, cookies and manual component refresh
 are preserved. This build was tested with mock subprocesses and local unit
 tests. Live Windows/Ubuntu Torrent and YouTube transfers need user testing.
+
+## 2.16.0 HTTP reliability and BitTorrent v2 compatibility (2026-11-23)
+
+- **Menu 1/2/6:** HTTP downloads use bounded retries for transient 408, 429 and
+  5xx responses, with a capped Retry-After delay; redirects remain supported.
+- Interrupted HTTP downloads retain `.part` and `.part.json` resume metadata.
+  Resume is permitted only when the URL and server ETag/Last-Modified validator
+  match, and only if the server acknowledges the requested byte range with a
+  matching 206 Content-Range response. Otherwise xGet restarts safely. This
+  prevents corrupt files caused by appending unrelated bytes. Completed files
+  are never overwritten.
+- If an `.exe`, `.zip`, `.msi`, `.deb`, `.apk`, etc. URL returns HTML, xGet
+  explains that it may be a login, download page, or anti-bot challenge. xGet
+  does **not** bypass authentication, CAPTCHAs, DRM, or site access controls.
+- **Menu 5:** detects BitTorrent v1, v2-only and hybrid `.torrent` files using
+  bounded offline metainfo inspection. Detects v1/v2 hashes in Magnet links.
+  A v2-only source does **not** get sent to incompatible aria2; xGet asks whether
+  to hand it off to an already installed qBittorrent GUI (libtorrent engine).
+  Hand-off is explicit and launches qBittorrent with the configured save folder.
+  The actual transfer then runs in qBittorrent; xGet does not falsely mark it
+  complete. Windows portable users may set `XGET_QBITTORRENT` to the executable.
+- v1 and hybrid Torrent downloads continue using aria2, preserving Torrent
+  file selection, concurrency, limits, hashes, existing files and resume data.
+  Failed aria2 runs print log-based diagnostics with Tracker/DHT/peer hints.
+- Menu 7 reports the local aria2 version and availability of qBittorrent.
+- Existing YouTube multi-URL, channel and playlist downloading, 5-error stop,
+  archive skipping and Deno/EJS diagnostics are preserved unchanged.
+
+A stalled Torrent with zero available seeds cannot be fixed by changing
+client code alone. Network firewall/UDP blocks, broken trackers, invalid
+metadata or unsupported BitTorrent v2 torrents are distinct problems.
+
+**Notes:** qBittorrent is optional and is not redistributed or installed by
+xGet. Real-site authentication and live peer availability cannot be verified
+by offline unit tests; try a known legal public Torrent and a public direct
+file link on both supported operating systems.
